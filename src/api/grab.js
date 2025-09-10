@@ -1,9 +1,14 @@
 import axios from 'axios'
 
 let grabToken = ''
+let grabUid = ''
 
 export function setGrabAuthToken(token) {
   grabToken = token || ''
+}
+
+export function setGrabUid(uid) {
+  grabUid = uid || ''
 }
 
 const grab = axios.create({
@@ -16,6 +21,11 @@ grab.interceptors.request.use((config) => {
   config.headers = config.headers || {}
   if (!config.headers['Content-Type']) {
     config.headers['Content-Type'] = 'application/json'
+  }
+  // Fixed platform header
+  config.headers['AppPlatform'] = 'H5'
+  if (grabUid) {
+    config.headers['uid'] = grabUid
   }
   if (grabToken) {
     config.headers['authorization'] = `Bearer ${grabToken}`

@@ -1,13 +1,13 @@
 <script setup>
 import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import request, { setAuthToken } from './api/request'
-import grab, { setGrabAuthToken } from './api/grab'
+import grab, { setGrabAuthToken, setGrabUid } from './api/grab'
 
 // ===== Auth state =====
 const phone = ref('')
 const smsCode = ref('')
 const isLoggingIn = ref(false)
-const user = ref(null) // { id, phone(masked), name, token }
+const user = ref(null) // { id, phone(masked), name, token, accId? }
 
 // Captcha & SMS state (modal flow)
 const captchaImage = ref('') // data URL
@@ -22,6 +22,7 @@ const quotaVisible = ref(false)
 const quotaTemp = ref(800)
 const uniqueId = ref('')
 const isPurchasing = ref(false)
+const aborted = ref(false)
 
 // Logs
 const logs = ref([])
@@ -45,7 +46,7 @@ async function fetchCaptcha() {
       captchaImage.value = `data:image/png;base64,${img64}`
       imageKey.value = key
       imageCode.value = ''
-      addLog('图形码已获取/刷新')
+      addLog(`图形码已获取/刷新${res?.message ? '：'+res.message : ''}`)
     } else {
       throw new Error('响应缺少图形码数据')
     }
@@ -100,11 +101,37 @@ async function exchangeGrabToken() {
     const res = await request.post('/natural/person/sso/authCode', { body: { ssoType: 'ticketSNO-person' } })
     const ticketSNO = res?.body?.ticketSNO
     if (!ticketSNO) throw new Error('未返回 ticketSNO')
-    setGrabAuthToken(ticketSNO)
-    localStorage.setItem('grabToken', ticketSNO)
-    addLog('已换取抢购系统凭证')
+    localStorage.setItem('ticketSNO', ticketSNO)
+    addLog(`已获取 ticketSNO${res?.message ? '：'+res.message : ''}`)
+
+    // exchange to final grab token
+    let finalToken = ''
+    try {
+      const r1 = await grab.post('/ai-smart-subsidy-approval/api/oauth2/code2Token', ticketSNO)
+      finalToken = r1?.data || ''
+      if (r1?.message) addLog(`code2Token 回应：${r1.message}`)
+    } catch (e) {}
+    if (!finalToken) {
+      try {
+        const r2 = await grab.post('/ai-smart-subsidy-approval/api/oauth2/code2Token', { ticketSNO })
+        finalToken = r2?.data || ''
+        if (r2?.message) addLog(`code2Token 回应：${r2.message}`)
+      } catch (e) {}
+    }
+    if (!finalToken) {
+      try {
+        const r3 = await grab.post('/ai-smart-subsidy-approval/api/oauth2/code2Token', { code: ticketSNO })
+        finalToken = r3?.data || ''
+        if (r3?.message) addLog(`code2Token 回应：${r3.message}`)
+      } catch (e) {}
+    }
+
+    if (!finalToken) throw new Error('未返回抢购token')
+    setGrabAuthToken(finalToken)
+    localStorage.setItem('grabToken', finalToken)
+    addLog('已换取抢购系统token')
   } catch (e) {
-    addLog(`换取抢购系统凭证失败：${e.message || e}`)
+    addLog(`换取抢购系统token失败：${e.message || e}`)
   }
 }
 
@@ -131,6 +158,7 @@ async function onLogin() {
     const res = await request.post('/natural/person/login/phone', payload)
     const name = res?.body?.name || '用户'
     const token = res?.body?.extend?.token || ''
+    const accId = res?.body?.accId || ''
     if (!token) {
       throw new Error('登录返回缺少token')
     }
@@ -138,11 +166,16 @@ async function onLogin() {
       id: Math.random().toString(36).slice(2, 8),
       phone: phone.value.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
       name,
-      token
+      token,
+      accId
     }
     setAuthToken(token)
+    if (accId) {
+      setGrabUid(accId)
+      localStorage.setItem('accId', accId)
+    }
     localStorage.setItem('auth', JSON.stringify({ name, token, phone: phone.value }))
-    addLog(`登录成功，欢迎：${name}`)
+    addLog(`登录成功，欢迎：${name}${res?.message ? '：'+res.message : ''}`)
     // exchange second-system token and get uniqueId
     await exchangeGrabToken()
     await fetchUniqueId()
@@ -158,40 +191,17 @@ function onLogout() {
   selectedQuota.value = null
   setAuthToken('')
   setGrabAuthToken('')
+  setGrabUid('')
   uniqueId.value = ''
   localStorage.removeItem('auth')
+  localStorage.removeItem('ticketSNO')
   localStorage.removeItem('grabToken')
   localStorage.removeItem('uniqueId')
+  localStorage.removeItem('accId')
   addLog('已退出登录')
 }
 
-onMounted(async () => {
-  const saved = localStorage.getItem('auth')
-  if (saved) {
-    try {
-      const parsed = JSON.parse(saved)
-      if (parsed?.token) {
-        user.value = {
-          id: Math.random().toString(36).slice(2, 8),
-          phone: (parsed.phone || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
-          name: parsed.name || '用户',
-          token: parsed.token
-        }
-        setAuthToken(parsed.token)
-        addLog('已恢复登录状态')
-        // restore or exchange grab token
-        const savedGrab = localStorage.getItem('grabToken')
-        if (savedGrab) {
-          setGrabAuthToken(savedGrab)
-        } else {
-          await exchangeGrabToken()
-        }
-        uniqueId.value = localStorage.getItem('uniqueId') || ''
-        await fetchUniqueId() // refresh uniqueId anyway
-      }
-    } catch {}
-  }
-})
+
 
 // ===== Grab API helpers =====
 async function fetchUniqueId() {
@@ -201,7 +211,7 @@ async function fetchUniqueId() {
     if (id) {
       uniqueId.value = String(id)
       localStorage.setItem('uniqueId', uniqueId.value)
-      addLog(`获取uniqueId成功：${uniqueId.value}`)
+      addLog(`获取uniqueId成功：${uniqueId.value}${res?.message ? '：'+res.message : ''}`)
     } else {
       throw new Error('未返回uniqueId')
     }
@@ -221,16 +231,17 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 async function getPositionIdByQuotaWithRetry() {
   let attempts = 0
   while (true) {
+    if (aborted.value) throw new Error('已停止')
     attempts++
     try {
       const res = await grab.post('/ai-smart-subsidy-approval/api/apply/getApplySubsidyPositionList')
       const list = res?.data?.tourismSubsidyPositions || []
       const match = list.find(x => Number(x.subsidyAmount) === Number(selectedQuota.value))
       if (match) {
-        addLog(`档位匹配成功，id=${match.id}`)
+        addLog(`档位匹配成功，id=${match.id}${res?.message ? '：'+res.message : ''}`)
         return match.id
       }
-      if (attempts % 20 === 1) addLog('档位未就绪，重试中...')
+      if (attempts % 20 === 1) addLog(`档位未就绪，重试中...${res?.message ? '（'+res.message+'）' : ''}`)
     } catch (e) {
       if (attempts % 20 === 1) addLog(`获取档位失败，重试中... ${e.message || e}`)
     }
@@ -241,33 +252,56 @@ async function getPositionIdByQuotaWithRetry() {
 async function getTicketWithRetry() {
   let attempts = 0
   while (true) {
+    if (aborted.value) throw new Error('已停止')
     attempts++
     try {
       const res = await grab.get('/hyd-queue/core/simple/entry')
       const ticket = res?.data?.ticket
       if (ticket) {
-        addLog('获取ticket成功')
-        return ticket
+        // validate ticket
+        const check = await grab.post('/ai-smart-subsidy-approval/api/queue/ticket/check', { ticket })
+        if (check?.success) {
+          addLog(`获取并校验ticket成功${check?.message ? '：'+check.message : ''}`)
+          return ticket
+        } else {
+          addLog(`ticket校验未通过${check?.message ? '：'+check.message : ''}，重试获取`)
+        }
+      } else if (attempts % 20 === 1) {
+        addLog(`ticket未就绪，重试中...${res?.message ? '（'+res.message+'）' : ''}`)
       }
-      if (attempts % 20 === 1) addLog('ticket未就绪，重试中...')
     } catch (e) {
-      if (attempts % 20 === 1) addLog(`获取ticket失败，重试中... ${e.message || e}`)
+      if (attempts % 20 === 1) addLog(`获取/校验ticket失败，重试中... ${e.message || e}`)
     }
     await sleep(200)
   }
 }
 
-async function submitApply({ uniqueIdVal, positionId, ticket }) {
-  try {
-    const payload = { uniqueId: String(uniqueIdVal), tourismSubsidyId: positionId, ticket }
-    const res = await grab.post('/ai-smart-subsidy-approval/api/apply/submitApply', payload)
-    if (res?.success) {
-      addLog('提交成功！抢购成功')
-    } else {
-      addLog(`提交结果：${res?.message || '未知'} (success=${String(res?.success)})`)
+async function submitApplyOnce({ uniqueIdVal, positionId, ticket }) {
+  const payload = { uniqueId: String(uniqueIdVal), tourismSubsidyId: positionId, ticket }
+  return grab.post('/ai-smart-subsidy-approval/api/apply/submitApply', payload)
+}
+
+async function submitApplyWithRetry({ uniqueIdVal, positionId, ticket }) {
+  let attempts = 0
+  while (true) {
+    if (aborted.value) throw new Error('已停止')
+    attempts++
+    try {
+      const res = await submitApplyOnce({ uniqueIdVal, positionId, ticket })
+      if (res?.success) {
+        addLog(`提交成功！${res?.message ? res.message : '抢购成功'}`)
+        return true
+      }
+      const msg = res?.message || ''
+      if (msg.includes('暂无补贴名额')) {
+        addLog(`名额已抢完，结束重试：${msg}`)
+        return false
+      }
+      if (attempts % 10 === 1) addLog(`提交失败，重试中... ${msg || '未知'}`)
+    } catch (e) {
+      if (attempts % 10 === 1) addLog(`提交异常，重试中... ${e.message || e}`)
     }
-  } catch (e) {
-    addLog(`提交失败：${e.message || e}`)
+    await sleep(200)
   }
 }
 
@@ -280,12 +314,13 @@ async function startGrab() {
     addLog('请先选择档位')
     return
   }
+  aborted.value = false
   isPurchasing.value = true
   try {
     await ensureUniqueId()
     const positionId = await getPositionIdByQuotaWithRetry()
     const ticket = await getTicketWithRetry()
-    await submitApply({ uniqueIdVal: uniqueId.value, positionId, ticket })
+    await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId, ticket })
   } catch (e) {
     addLog(`抢购流程异常：${e.message || e}`)
   } finally {
@@ -315,7 +350,16 @@ function formatMs(ms) {
   return `${sign}${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(msRemain).padStart(3,'0')}`
 }
 
+function formatTime(date) {
+  const pad = (n, w=2) => String(n).padStart(w, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 const isLoggedIn = computed(() => !!(user.value && user.value.token))
+const nowText = ref('')
+const startTargetText = ref('')
+const deviceTimeText = ref('')
+let deviceClockId = null
 
 function onStartClick() {
   if (!isLoggedIn.value) {
@@ -337,6 +381,7 @@ function confirmQuotaThenStart() {
     startGrab()
     return
   }
+  startTargetText.value = formatTime(target)
   startCountdownInternal(target)
 }
 
@@ -345,8 +390,9 @@ function startCountdownInternal(target) {
   isCounting.value = true
   clearInterval(timerId)
   timerId = setInterval(() => {
-    const now = Date.now()
-    const d = target.getTime() - now
+    const now = new Date()
+    const d = target.getTime() - now.getTime()
+    nowText.value = `${formatTime(now)}`
     if (d <= 0) {
       countdownText.value = '00:00:00.000'
       stopCountdown()
@@ -354,7 +400,7 @@ function startCountdownInternal(target) {
     } else {
       countdownText.value = formatMs(d)
     }
-  }, 30)
+  }, 250)
 }
 
 function stopCountdown() {
@@ -364,8 +410,51 @@ function stopCountdown() {
   addLog('倒计时已停止')
 }
 
+function onStopAll() {
+  aborted.value = true
+  stopCountdown()
+  isPurchasing.value = false
+  addLog('已手动停止当前流程')
+}
+
+onMounted(async () => {
+  const saved = localStorage.getItem('auth')
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved)
+      if (parsed?.token) {
+        user.value = {
+          id: Math.random().toString(36).slice(2, 8),
+          phone: (parsed.phone || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
+          name: parsed.name || '用户',
+          token: parsed.token,
+          accId: localStorage.getItem('accId') || ''
+        }
+        setAuthToken(parsed.token)
+        const accId = user.value.accId
+        if (accId) setGrabUid(accId)
+        addLog('已恢复登录状态')
+        const savedGrab = localStorage.getItem('grabToken')
+        if (savedGrab) {
+          setGrabAuthToken(savedGrab)
+        } else {
+          await exchangeGrabToken()
+        }
+        uniqueId.value = localStorage.getItem('uniqueId') || ''
+        await fetchUniqueId()
+      }
+    } catch {}
+  }
+  // device clock every second
+  deviceTimeText.value = formatTime(new Date())
+  deviceClockId = setInterval(() => {
+    deviceTimeText.value = formatTime(new Date())
+  }, 1000)
+})
+
 onBeforeUnmount(() => {
   if (timerId) clearInterval(timerId)
+  if (deviceClockId) clearInterval(deviceClockId)
 })
 </script>
 
@@ -406,15 +495,19 @@ onBeforeUnmount(() => {
     <section class="panel">
       <h2>抢购控制</h2>
       <div class="control-stack">
+        <div class="time-row">设备时间：{{ deviceTimeText }}</div>
         <label class="label">开始时间</label>
         <input class="input time-input" type="time" step="1" v-model="startTime" />
         <div class="row">
-          <button class="btn primary" v-if="!isCounting" @click="onStartClick" :disabled="isPurchasing">开始抢购</button>
-          <button class="btn" v-else @click="stopCountdown" :disabled="isPurchasing">停止</button>
+          <button class="btn primary" @click="onStartClick" :disabled="isPurchasing || isCounting">开始抢购</button>
+          <button class="btn" @click="onStopAll" :disabled="!(isCounting || isPurchasing)">停止</button>
         </div>
         <div class="hint" v-if="selectedQuota">已选择档位：{{ selectedQuota }}</div>
       </div>
-      <div class="countdown" v-if="isCounting">倒计时：{{ countdownText }}</div>
+      <div class="countdown" v-if="isCounting">
+        倒计时：{{ countdownText }}
+        <div class="time-row">当前时间：{{ nowText }} ｜ 开始时间：{{ startTargetText }}</div>
+      </div>
       <div class="hint" v-else>未开始，默认 {{ startTime }}（若已过当前时间，将立即开始）</div>
     </section>
 
@@ -605,6 +698,12 @@ h2 {
 .countdown {
   margin-top: 0.5rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.time-row {
+  margin-top: 0.25rem;
+  font-size: 0.95rem;
+  color: var(--c-muted);
 }
 
 .log-box {
