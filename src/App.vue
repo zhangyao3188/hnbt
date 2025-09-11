@@ -283,21 +283,24 @@ async function submitApplyOnce({ uniqueIdVal, positionId, ticket }) {
 
 async function submitApplyWithRetry({ uniqueIdVal, positionId, ticket }) {
   let attempts = 0
+  let currentTicket = ticket
   while (true) {
     if (aborted.value) throw new Error('已停止')
     attempts++
     try {
-      const res = await submitApplyOnce({ uniqueIdVal, positionId, ticket })
+      const res = await submitApplyOnce({ uniqueIdVal, positionId, ticket: currentTicket })
       if (res?.success) {
         addLog(`提交成功！${res?.message ? res.message : '抢购成功'}`)
         return true
       }
       const msg = res?.message || ''
-      if (msg.includes('暂无补贴名额')) {
-        addLog(`名额已抢完，结束重试：${msg}`)
-        return false
+      const code = res?.code || ''
+      if (code === 'TICKET_INVALID' || /票据无效|过期/.test(msg)) {
+        addLog(`ticket无效/过期，重新获取ticket重试... ${code ? '['+code+'] ' : ''}${msg}`)
+        currentTicket = await getTicketWithRetry()
+        continue
       }
-      if (attempts % 10 === 1) addLog(`提交失败，重试中... ${msg || '未知'}`)
+      if (attempts % 10 === 1) addLog(`提交失败，重试中... ${code ? '['+code+'] ' : ''}${msg || '未知'}`)
     } catch (e) {
       if (attempts % 10 === 1) addLog(`提交异常，重试中... ${e.message || e}`)
     }
