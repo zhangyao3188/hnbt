@@ -16,6 +16,10 @@ const imageCode = ref('')
 const smsSending = ref(false)
 const captchaVisible = ref(false)
 
+// Export/Import modal state
+const importVisible = ref(false)
+const importText = ref('')
+
 // Purchase related state
 const selectedQuota = ref(null) // 800 or 300
 const quotaVisible = ref(false)
@@ -34,6 +38,86 @@ function addLog(message) {
 
 function clearLogs() {
   logs.value = []
+}
+
+async function onExportUser() {
+  try {
+    const authRaw = localStorage.getItem('auth')
+    const auth = authRaw ? JSON.parse(authRaw) : {}
+    const data = {
+      name: auth?.name || user.value?.name || '',
+      phone: auth?.phone || '',
+      token: auth?.token || user.value?.token || '',
+      accId: localStorage.getItem('accId') || '',
+      ticketSNO: localStorage.getItem('ticketSNO') || '',
+      grabToken: localStorage.getItem('grabToken') || '',
+      uniqueId: localStorage.getItem('uniqueId') || ''
+    }
+    const text = JSON.stringify(data, null, 2)
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    addLog('用户信息已复制到剪贴板')
+  } catch (e) {
+    addLog(`导出失败：${e.message || e}`)
+  }
+}
+
+function openImportUser() {
+  importText.value = ''
+  importVisible.value = true
+}
+
+async function onConfirmImport() {
+  try {
+    const obj = JSON.parse(importText.value || '{}')
+    const name = obj.name || user.value?.name || '用户'
+    const token = obj.token || ''
+    const phoneRaw = obj.phone || ''
+    const accId = obj.accId || ''
+    const ticketSNO = obj.ticketSNO || ''
+    const grabToken = obj.grabToken || ''
+    const uniq = obj.uniqueId || ''
+
+    if (token) {
+      setAuthToken(token)
+      localStorage.setItem('auth', JSON.stringify({ name, token, phone: phoneRaw }))
+      user.value = {
+        id: Math.random().toString(36).slice(2, 8),
+        phone: (phoneRaw || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
+        name,
+        token,
+        accId: accId || user.value?.accId || ''
+      }
+    }
+    if (accId) {
+      setGrabUid(accId)
+      localStorage.setItem('accId', accId)
+    }
+    if (ticketSNO) {
+      localStorage.setItem('ticketSNO', ticketSNO)
+    }
+    if (grabToken) {
+      setGrabAuthToken(grabToken)
+      localStorage.setItem('grabToken', grabToken)
+    }
+    if (uniq) {
+      uniqueId.value = String(uniq)
+      localStorage.setItem('uniqueId', uniqueId.value)
+    }
+
+    importVisible.value = false
+    addLog('导入完成，已写入本地缓存并同步到运行状态')
+  } catch (e) {
+    addLog(`导入失败：${e.message || e}`)
+  }
 }
 
 // ===== Captcha & SMS =====
@@ -228,7 +312,7 @@ async function ensureUniqueId() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
-async function getPositionIdByQuotaWithRetry() {
+async function getPositionsWithRetry() {
   let attempts = 0
   while (true) {
     if (aborted.value) throw new Error('已停止')
@@ -237,9 +321,16 @@ async function getPositionIdByQuotaWithRetry() {
       const res = await grab.post('/ai-smart-subsidy-approval/api/apply/getApplySubsidyPositionList')
       const list = res?.data?.tourismSubsidyPositions || []
       const match = list.find(x => Number(x.subsidyAmount) === Number(selectedQuota.value))
+      const foodList = res?.data?.foodSubsidyPositions || []
+      let foodId = null
+      if (Array.isArray(foodList) && foodList.length > 0) {
+        const maxFood = foodList.reduce((a, b) => Number(a.subsidyAmount) >= Number(b.subsidyAmount) ? a : b)
+        foodId = maxFood?.id ?? null
+        addLog(`餐饮档位选择：id=${foodId}，补贴=${maxFood?.subsidyAmount}${res?.message ? '：'+res.message : ''}`)
+      }
       if (match) {
-        addLog(`档位匹配成功，id=${match.id}${res?.message ? '：'+res.message : ''}`)
-        return match.id
+        addLog(`旅游档位匹配成功，id=${match.id}${res?.message ? '：'+res.message : ''}`)
+        return { tourismId: match.id, foodId }
       }
       if (attempts % 20 === 1) addLog(`档位未就绪，重试中...${res?.message ? '（'+res.message+'）' : ''}`)
     } catch (e) {
@@ -276,19 +367,20 @@ async function getTicketWithRetry() {
   }
 }
 
-async function submitApplyOnce({ uniqueIdVal, positionId, ticket }) {
+async function submitApplyOnce({ uniqueIdVal, positionId, ticket, foodSubsidyId }) {
   const payload = { uniqueId: String(uniqueIdVal), tourismSubsidyId: positionId, ticket }
+  if (foodSubsidyId) payload.foodSubsidyId = foodSubsidyId
   return grab.post('/ai-smart-subsidy-approval/api/apply/submitApply', payload)
 }
 
-async function submitApplyWithRetry({ uniqueIdVal, positionId, ticket }) {
+async function submitApplyWithRetry({ uniqueIdVal, positionId, ticket, foodSubsidyId }) {
   let attempts = 0
   let currentTicket = ticket
   while (true) {
     if (aborted.value) throw new Error('已停止')
     attempts++
     try {
-      const res = await submitApplyOnce({ uniqueIdVal, positionId, ticket: currentTicket })
+      const res = await submitApplyOnce({ uniqueIdVal, positionId, ticket: currentTicket, foodSubsidyId })
       if (res?.success) {
         addLog(`提交成功！${res?.message ? res.message : '抢购成功'}`)
         return true
@@ -321,9 +413,9 @@ async function startGrab() {
   isPurchasing.value = true
   try {
     await ensureUniqueId()
-    const positionId = await getPositionIdByQuotaWithRetry()
+    const { tourismId, foodId } = await getPositionsWithRetry()
     const ticket = await getTicketWithRetry()
-    await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId, ticket })
+    await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
   } catch (e) {
     addLog(`抢购流程异常：${e.message || e}`)
   } finally {
@@ -493,6 +585,10 @@ onBeforeUnmount(() => {
         </div>
         <button class="btn" @click="onLogout">退出登录</button>
       </div>
+      <div v-if="isLoggedIn" class="row">
+        <button class="btn small" @click="onExportUser">导出</button>
+        <button class="btn small" @click="openImportUser">导入</button>
+      </div>
     </section>
 
     <section class="panel">
@@ -553,11 +649,27 @@ onBeforeUnmount(() => {
           <div class="quota-options">
             <label class="radio"><input type="radio" value="800" v-model.number="quotaTemp" /> 800</label>
             <label class="radio"><input type="radio" value="300" v-model.number="quotaTemp" /> 300</label>
+            <label class="radio"><input type="radio" value="1500" v-model.number="quotaTemp" /> 1500</label>
+            <label class="radio"><input type="radio" value="3000" v-model.number="quotaTemp" /> 3000</label>
           </div>
         </div>
         <div class="modal-actions">
           <button class="btn" @click="quotaVisible=false">取消</button>
           <button class="btn primary" @click="confirmQuotaThenStart">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Import Modal -->
+    <div v-if="importVisible" class="modal-mask" @click.self="importVisible=false">
+      <div class="modal">
+        <div class="modal-title">导入用户信息</div>
+        <div class="modal-body">
+          <textarea class="input" rows="8" placeholder="粘贴导出的JSON" v-model.trim="importText"></textarea>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" @click="importVisible=false">取消</button>
+          <button class="btn primary" @click="onConfirmImport">确认导入</button>
         </div>
       </div>
     </div>
@@ -796,5 +908,9 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
+}
+
+textarea.input {
+  resize: vertical;
 }
 </style>
