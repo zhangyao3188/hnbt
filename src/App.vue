@@ -587,8 +587,8 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="isLoggedIn" class="row">
         <button class="btn small" @click="onExportUser">导出</button>
-        <button class="btn small" @click="openImportUser">导入</button>
       </div>
+        <button class="btn small" @click="openImportUser">导入</button>
     </section>
 
     <section class="panel">
