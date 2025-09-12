@@ -3,6 +3,79 @@ import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import request, { setAuthToken } from './api/request'
 import grab, { setGrabAuthToken, setGrabUid } from './api/grab'
 
+// Server酱推送配置（页面可填写，默认读取本地缓存）
+const sctKey = ref(localStorage.getItem('sctKey') || '')
+const sctLocked = ref(localStorage.getItem('sctKeyLocked') === '1')
+const SCT_SEND_URL = computed(() => (sctKey.value ? `https://sctapi.ftqq.com/${sctKey.value}.send` : ''))
+const sctDisplay = computed(() => sctKey.value ? `${sctKey.value.slice(0,4)}...${sctKey.value.slice(-4)}` : '未设置')
+
+function saveSctKey() {
+  sctKey.value = (sctKey.value || '').trim()
+  localStorage.setItem('sctKey', sctKey.value)
+  sctLocked.value = true
+  localStorage.setItem('sctKeyLocked', '1')
+  addLog('已保存并锁定推送Key')
+}
+function unlockSctKey() {
+  sctLocked.value = false
+  localStorage.removeItem('sctKeyLocked')
+  addLog('已解锁推送Key，可编辑')
+}
+
+async function sendTestPush() {
+  if (!SCT_SEND_URL.value) {
+    addLog('未配置Server酱推送Key，无法测试推送')
+    return
+  }
+  try {
+    const payload = {
+      title: '测试推送',
+      desp: '这是测试推送功能的内容',
+      short: '测试推送',
+      noip: 1,
+      channel: '9'
+    }
+    const res = await fetch(SCT_SEND_URL.value, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json;charset=utf-8' },
+      body: JSON.stringify(payload)
+    })
+    const json = await res.json().catch(() => ({}))
+    addLog(`测试推送结果：${json?.message || json?.msg || '已请求推送'}`)
+  } catch (e) {
+    addLog(`测试推送失败：${e.message || e}`)
+  }
+}
+
+async function sendPushOnSuccess({ name, phone, quota, time, uniqueId }) {
+  if (!SCT_SEND_URL.value) {
+    addLog('未配置Server酱推送Key，已跳过推送')
+    return
+  }
+  try {
+    const title = `抢购成功或重复提交-${name || '用户'}-${quota}`.slice(0, 32)
+    const lines = [
+      `账号：${phone || ''}`,
+      `姓名：${name || ''}`,
+      `档位：${quota || ''}`,
+      `时间：${time || new Date().toLocaleString()}`,
+      `uniqueId：${uniqueId || ''}`
+    ]
+    const desp = lines.join('\n')
+    const shortText = `成功 ${quota} | ${name || ''} ${phone || ''}`.slice(0, 64)
+    const payload = { title, desp, short: shortText, noip: 1, channel: '9' }
+    const res = await fetch(SCT_SEND_URL.value, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json;charset=utf-8' },
+      body: JSON.stringify(payload)
+    })
+    const json = await res.json().catch(() => ({}))
+    addLog(`推送结果：${json?.message || json?.msg || '已请求推送'}`)
+  } catch (e) {
+    addLog(`推送失败：${e.message || e}`)
+  }
+}
+
 // ===== Auth state =====
 const phone = ref('')
 const smsCode = ref('')
@@ -381,8 +454,8 @@ async function submitApplyWithRetry({ uniqueIdVal, positionId, ticket, foodSubsi
     attempts++
     try {
       const res = await submitApplyOnce({ uniqueIdVal, positionId, ticket: currentTicket, foodSubsidyId })
-      if (res?.success) {
-        addLog(`提交成功！${res?.message ? res.message : '抢购成功'}`)
+      if (res?.success || res?.message.includes("重复提交")) {
+        addLog(res?.success ? `提交成功！${res?.message ? res.message : '抢购成功'}` : `用户已经在其他渠道提交成功：${res?.message}`)
         return true
       }
       const msg = res?.message || ''
@@ -415,7 +488,16 @@ async function startGrab() {
     await ensureUniqueId()
     const { tourismId, foodId } = await getPositionsWithRetry()
     const ticket = await getTicketWithRetry()
-    await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
+    const success = await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
+    if (success && SCT_SEND_URL.value) {
+      await sendPushOnSuccess({
+        name: user.value?.name || '用户',
+        phone: user.value?.phone || '',
+        quota: selectedQuota.value,
+        time: new Date().toLocaleString(),
+        uniqueId: uniqueId.value,
+      })
+    }
   } catch (e) {
     addLog(`抢购流程异常：${e.message || e}`)
   } finally {
@@ -556,6 +638,17 @@ onBeforeUnmount(() => {
 <template>
   <div id="page">
     <section class="panel">
+      <h2>推送配置</h2>
+      <div class="row">
+        <input class="input" type="text" placeholder="Server酱 Send Key" v-model.trim="sctKey" :disabled="sctLocked" />
+        <button class="btn secondary" v-if="!sctLocked" @click="saveSctKey" :disabled="!sctKey">保存并锁定</button>
+        <button class="btn" v-else @click="unlockSctKey">解锁</button>
+        <button class="btn primary" @click="sendTestPush" :disabled="!SCT_SEND_URL">测试推送</button>
+      </div>
+      <div class="hint">当前Key：{{ sctKey ? (sctLocked ? sctDisplay : '未锁定') : '未设置' }}；推送通道固定：9（服务号）</div>
+    </section>
+
+    <section class="panel">
       <h2>登录</h2>
       <div v-if="!isLoggedIn" class="form-grid">
         <input
@@ -587,8 +680,8 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="isLoggedIn" class="row">
         <button class="btn small" @click="onExportUser">导出</button>
-      </div>
         <button class="btn small" @click="openImportUser">导入</button>
+      </div>
     </section>
 
     <section class="panel">
