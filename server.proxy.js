@@ -15,14 +15,17 @@ const PORT = Number(process.env.PROXY_PORT || config.serverPort || 5179)
 const TARGET = process.env.GRAB_TARGET || config.grabTarget || 'https://ai-smart-subsidy-backend.digitalhainan.com.cn'
 
 // Upstream proxy state
-// Per-session (x-proxy-key) mapping: { key: { url, expireAt, lastUsed, requestCount } }
+// Per-session (x-proxy-key) mapping: { key: { url, expireAt, lastUsed, requestCount, proxyIp, consecutiveErrors, performanceHistory, performanceAnomalies, firstReportSkipped } }
 const sessionProxyMap = new Map()
 
-// Request tracking for logging
-const requestStats = {
-  lastRequests: new Map(), // key -> { proxyIp, response, timestamp }
-  totalRequests: 0
-}
+// Request tracking for logging and cleanup
+const sessionHistory = new Map() // key -> [{ requestCount, timestamp }, ...]
+let lastStatusTime = Date.now()
+
+// Proxy quality monitoring constants (from config)
+const CONSECUTIVE_ERROR_THRESHOLD = config.qualityMonitoring?.consecutiveErrorThreshold || 5
+const PERFORMANCE_REQUEST_THRESHOLD = config.qualityMonitoring?.performanceRequestThreshold || 100
+const PERFORMANCE_ANOMALY_THRESHOLD = config.qualityMonitoring?.performanceAnomalyThreshold || 2
 
 function parseProviderResponse(json) {
   try {
@@ -77,14 +80,18 @@ async function acquireProxy() {
     const res = await fetch(url, { signal: ac.signal })
     const bodyText = await res.text().catch(() => '')
     if (!res.ok) {
-      console.warn(`[proxy] provider HTTP ${res.status}: ${res.statusText}; body=${(bodyText || '').slice(0, 300)}`)
+      console.log('============================================================')
+    console.warn(`[proxy] provider HTTP ${res.status}: ${res.statusText}; body=${(bodyText || '').slice(0, 300)}`)
+    console.log('============================================================\n')
       throw new Error(`provider HTTP ${res.status}: ${res.statusText}`)
     }
     let json
     try {
       json = bodyText ? JSON.parse(bodyText) : {}
     } catch (e) {
-      console.warn('[proxy] provider returned non-JSON body:', (bodyText || '').slice(0, 300))
+      console.log('============================================================')
+    console.warn('[proxy] provider returned non-JSON body:', (bodyText || '').slice(0, 300))
+    console.log('============================================================\n')
       throw new Error('provider returned non-JSON body')
     }
     let parsed
@@ -92,7 +99,9 @@ async function acquireProxy() {
       parsed = parseProviderResponse(json)
     } catch (e) {
       // Print full provider response for diagnosis (e.g., 未在白名单)
+      console.log('============================================================')
       console.warn('[proxy] provider response (failure):', JSON.stringify(json))
+      console.log('============================================================\n')
       throw e
     }
     const { proxyUrl, safeExpireTs, proxyIp } = parsed
@@ -206,15 +215,24 @@ async function ensureProxyFresh(key, force = false) {
         expireAt: safeExpireTs, 
         proxyIp,
         lastUsed: now,
-        requestCount: 0
+        requestCount: 0,
+        consecutiveErrors: 0,
+        performanceHistory: [],
+        performanceAnomalies: 0,
+        firstReportSkipped: false,
+        zeroRequestCount: 0
       }
       sessionProxyMap.set(key, newEntry)
       
       // Log proxy change
       if (oldEntry) {
+        console.log('============================================================')
         console.log(`[${oldEntry.proxyIp}]过期，替换为ip[${proxyIp}]`)
+        console.log('============================================================\n')
       } else {
+        console.log('============================================================')
         console.log(`[${proxyIp}] 新代理已获取`)
+        console.log('============================================================\n')
       }
       
       logProxyUsage()
@@ -226,31 +244,241 @@ async function ensureProxyFresh(key, force = false) {
   return sessionProxyMap.get(key)
 }
 
-// Log current proxy usage status
-function logProxyUsage() {
+// Direct connection tracking for 30s reports
+let directConnectionCount = 0
+let lastDirectConnectionReset = Date.now()
+
+// Log current proxy usage status with timestamps
+function logProxyUsage(scheduled = false) {
+  console.log('============================================================')
+  
   if (!config.enableProxy) {
-    console.log('目前正在使用的代理ip：0个 (代理已禁用，使用直连)')
+    const now = new Date()
+    console.log(`[${now.toLocaleTimeString()}] 目前正在使用的代理ip：0个 (代理已禁用，使用直连)`)
+    console.log('============================================================\n')
     return
   }
   
+  const now = new Date()
   const activeProxies = Array.from(sessionProxyMap.values())
-  console.log(`目前正在使用的代理ip：${activeProxies.length}个`)
+  const nextTime = new Date(now.getTime() + 30000)
+  
+  console.log(`[${now.toLocaleTimeString()}] 目前正在使用的代理ip：${activeProxies.length}个${scheduled ? ` (下次输出时间: ${nextTime.toLocaleTimeString()})` : ''}`)
   
   activeProxies.forEach(entry => {
     const expireTime = new Date(entry.expireAt).toLocaleTimeString()
-    console.log(`[${entry.proxyIp}]: 过期时间 ${expireTime}, 请求次数 ${entry.requestCount}`)
+    console.log(`  [${entry.proxyIp}]: 过期时间 ${expireTime}, 请求次数 ${entry.requestCount}`)
   })
-}
-
-// Log request details
-function logRequest(key, proxyIp, responseData) {
-  if (config.enableProxy && proxyIp) {
-    const truncatedResponse = JSON.stringify(responseData).substring(0, 100)
-    console.log(`[${proxyIp}]: ${truncatedResponse}${responseData && JSON.stringify(responseData).length > 100 ? '...' : ''}`)
+  
+  // Show direct connection stats in 30s reports
+  if (scheduled && directConnectionCount > 0) {
+    console.log(`  [直连]: 请求次数 ${directConnectionCount}`)
+    // Reset counter after reporting
+    directConnectionCount = 0
+    lastDirectConnectionReset = Date.now()
+  }
+  
+  console.log('============================================================\n')
+  
+  // Record current status for cleanup tracking and performance monitoring
+  if (scheduled) {
+    const currentTime = Date.now()
+    const proxiesToForceSwitch = []
+    
+    activeProxies.forEach(entry => {
+      const key = getKeyByProxy(entry.url)
+      if (key) {
+        if (!sessionHistory.has(key)) {
+          sessionHistory.set(key, [])
+        }
+        const history = sessionHistory.get(key)
+        const lastRecord = history[history.length - 1]
+        const previousCount = lastRecord ? lastRecord.requestCount : 0
+        const newRequests = entry.requestCount - previousCount
+        
+        history.push({ requestCount: entry.requestCount, timestamp: currentTime })
+        
+        // Performance monitoring (skip first report)
+        if (!entry.firstReportSkipped) {
+          entry.firstReportSkipped = true
+          console.log(`  [${entry.proxyIp}]: 过期时间 ${new Date(entry.expireAt).toLocaleTimeString()}, 请求次数 ${entry.requestCount} (首次报告，跳过性能判断)`)
+        } else {
+          // Check performance after first report
+          const isPerformancePoor = newRequests > 0 && newRequests < PERFORMANCE_REQUEST_THRESHOLD
+          const isZeroRequests = newRequests === 0
+          
+          if (isZeroRequests) {
+            // 特殊处理：新增请求为0的情况
+            entry.zeroRequestCount = (entry.zeroRequestCount || 0) + 1
+            console.log(`  [${entry.proxyIp}]: 过期时间 ${new Date(entry.expireAt).toLocaleTimeString()}, 请求次数 ${entry.requestCount} (新增${newRequests}次, 连续零请求: ${entry.zeroRequestCount}次, 交由不活跃检测处理)`)
+            
+            // 零请求不触发强制切换，由不活跃检测(3分钟)处理
+            // 清除性能异常计数，因为零请求不代表性能差
+            if (entry.performanceAnomalies > 0) {
+              entry.performanceAnomalies = 0
+            }
+          } else if (isPerformancePoor) {
+            // 有请求但数量低于阈值，视为性能差
+            entry.performanceAnomalies = (entry.performanceAnomalies || 0) + 1
+            entry.zeroRequestCount = 0 // 重置零请求计数
+            console.log(`  [${entry.proxyIp}]: 过期时间 ${new Date(entry.expireAt).toLocaleTimeString()}, 请求次数 ${entry.requestCount} (新增${newRequests}次 < ${PERFORMANCE_REQUEST_THRESHOLD}, 性能异常: ${entry.performanceAnomalies}/${PERFORMANCE_ANOMALY_THRESHOLD})`)
+            
+            if (entry.performanceAnomalies >= PERFORMANCE_ANOMALY_THRESHOLD) {
+              proxiesToForceSwitch.push({ key, reason: '性能低下' })
+            }
+          } else {
+            // 性能正常，重置所有异常计数
+            const hadAnomalies = entry.performanceAnomalies > 0
+            entry.performanceAnomalies = 0
+            entry.zeroRequestCount = 0
+            
+            if (hadAnomalies) {
+              console.log(`  [${entry.proxyIp}]: 过期时间 ${new Date(entry.expireAt).toLocaleTimeString()}, 请求次数 ${entry.requestCount} (新增${newRequests}次 ≥ ${PERFORMANCE_REQUEST_THRESHOLD}, 性能恢复，清除异常计数)`)
+            } else {
+              console.log(`  [${entry.proxyIp}]: 过期时间 ${new Date(entry.expireAt).toLocaleTimeString()}, 请求次数 ${entry.requestCount} (新增${newRequests}次)`)
+            }
+          }
+        }
+        
+        // Keep only last 7 records for 3-minute cleanup check (6 intervals + 1 current)
+        if (history.length > 7) {
+          history.splice(0, history.length - 7)
+        }
+      }
+    })
+    
+    // Force switch poor performance proxies
+    for (const { key, reason } of proxiesToForceSwitch) {
+      forceSwitchProxy(key, reason).catch(err => {
+        console.log('============================================================')
+        console.warn(`强制切换失败: ${err?.message || err}`)
+        console.log('============================================================\n')
+      })
+    }
+    
+    // Check for inactive proxies (no request count change in last 6 intervals = 3 minutes)
+    cleanupInactiveProxies()
   }
 }
 
-// Background proxy refresh scheduler
+function getKeyByProxy(proxyUrl) {
+  for (const [key, entry] of sessionProxyMap.entries()) {
+    if (entry.url === proxyUrl) {
+      return key
+    }
+  }
+  return null
+}
+
+// Track request errors and determine if it should count as consecutive error
+function trackRequestError(key, error, statusCode) {
+  const entry = sessionProxyMap.get(key)
+  if (!entry) return false
+  
+  // Only count 500 status codes and timeouts as consecutive errors
+  const isConsecutiveError = statusCode === 500 || 
+    (error && (error.name === 'AbortError' || error.message.includes('timeout') || error.message.includes('ETIMEDOUT')))
+  
+  if (isConsecutiveError) {
+    entry.consecutiveErrors = (entry.consecutiveErrors || 0) + 1
+    console.log('============================================================')
+    console.log(`[${entry.proxyIp}] 连续错误计数: ${entry.consecutiveErrors}/${CONSECUTIVE_ERROR_THRESHOLD}`)
+    console.log('============================================================\n')
+    
+    if (entry.consecutiveErrors >= CONSECUTIVE_ERROR_THRESHOLD) {
+      console.log('============================================================')
+      console.log(`[${entry.proxyIp}] 连续${CONSECUTIVE_ERROR_THRESHOLD}次错误，标记为问题代理，强制切换`)
+      console.log('============================================================\n')
+      return true // Need force switch
+    }
+  } else {
+    // Reset consecutive errors for non-critical errors (429, 403, etc.)
+    if (entry.consecutiveErrors > 0) {
+      console.log('============================================================')
+      console.log(`[${entry.proxyIp}] 非关键错误，清除连续错误计数`)
+      console.log('============================================================\n')
+      entry.consecutiveErrors = 0
+    }
+  }
+  
+  return false
+}
+
+// Force switch proxy due to consecutive errors or poor performance
+async function forceSwitchProxy(key, reason) {
+  const oldEntry = sessionProxyMap.get(key)
+  if (!oldEntry) return null
+  
+  try {
+    const { proxyUrl, safeExpireTs, proxyIp } = await acquireProxy()
+    const newEntry = {
+      url: proxyUrl,
+      expireAt: safeExpireTs,
+      proxyIp: proxyIp,
+      requestCount: 0,
+      lastUsed: Date.now(),
+      consecutiveErrors: 0,
+      performanceHistory: [],
+      performanceAnomalies: 0,
+      firstReportSkipped: false,
+      zeroRequestCount: 0
+    }
+    
+    sessionProxyMap.set(key, newEntry)
+    sessionHistory.delete(key) // Reset history for new proxy
+    
+    console.log('============================================================')
+    console.log(`[${oldEntry.proxyIp}] 强制切换 (原因: ${reason}) → [${proxyIp}]`)
+    console.log('============================================================\n')
+    
+    return newEntry
+  } catch (error) {
+    console.log('============================================================')
+    console.warn(`强制切换失败: ${error?.message || error}`)
+    console.log('============================================================\n')
+    return null
+  }
+}
+
+function cleanupInactiveProxies() {
+  const toRemove = []
+  
+  for (const [key, history] of sessionHistory.entries()) {
+    if (history.length >= 6) {
+      const latest = history[history.length - 1]
+      const sixIntervalsAgo = history[history.length - 6]
+      
+      // If request count hasn't changed in last 6 intervals (3 minutes)
+      if (latest.requestCount === sixIntervalsAgo.requestCount) {
+        const entry = sessionProxyMap.get(key)
+        if (entry) {
+          console.log('============================================================')
+          console.log(`  [${entry.proxyIp}] 检测到3分钟无活动，释放代理 (窗口可能已关闭)`)
+          console.log('============================================================\n')
+          toRemove.push(key)
+        }
+      }
+    }
+  }
+  
+  toRemove.forEach(key => {
+    sessionProxyMap.delete(key)
+    sessionHistory.delete(key)
+  })
+}
+
+// Log request details (real-time)
+function logRequest(key, proxyIp, responseData) {
+  if (config.enableProxy && proxyIp) {
+    console.log('============================================================')
+    const now = new Date().toLocaleTimeString()
+    const truncatedResponse = JSON.stringify(responseData).substring(0, 100)
+    console.log(`[${now}][${proxyIp}]: ${truncatedResponse}${responseData && JSON.stringify(responseData).length > 100 ? '...' : ''}`)
+    console.log('============================================================\n')
+  }
+}
+
+// Background proxy refresh and status scheduler
 function startProxyRefreshScheduler() {
   if (!config.enableProxy) {
     return // No need for background refresh if proxy is disabled
@@ -258,6 +486,11 @@ function startProxyRefreshScheduler() {
   
   const refreshIntervalMs = (config.upstream?.refreshBeforeExpirySec || 10) * 1000
   const checkIntervalMs = Math.min(refreshIntervalMs, 30000) // Check every 30s or refresh interval, whichever is smaller
+  
+  // Status reporting every 30s
+  setInterval(() => {
+    logProxyUsage(true)
+  }, 30000)
   
   setInterval(async () => {
     const now = Date.now()
@@ -268,7 +501,9 @@ function startProxyRefreshScheduler() {
         try {
           await ensureProxyFresh(key, true)
         } catch (error) {
+          console.log('============================================================')
           console.warn(`[${entry.proxyIp}] 后台刷新失败: ${error?.message || error}`)
+          console.log('============================================================\n')
           sessionProxyMap.delete(key)
         }
       }
@@ -305,23 +540,35 @@ app.get('/proxy-status', (_req, res) => {
 app.use('/grab', async (req, res, next) => {
   try {
     const key = String(req.headers['x-proxy-key'] || 'default')
+    const useProxy = req.headers['x-use-proxy'] !== 'false' // default true unless explicitly false
     let entry = null
     let proxyUrl = null
     
-    try {
-      entry = await ensureProxyFresh(key, false)
-      proxyUrl = entry?.url
-      
-      // Update request count and last used time
-      if (entry) {
-        entry.requestCount++
-        entry.lastUsed = Date.now()
-      }
-    } catch (proxyError) {
-      if (config.enableProxy) {
+    if (config.enableProxy && useProxy) {
+      try {
+        entry = await ensureProxyFresh(key, false)
+        proxyUrl = entry?.url
+        
+        // Update request count and last used time
+        if (entry) {
+          entry.requestCount++
+          entry.lastUsed = Date.now()
+        }
+      } catch (proxyError) {
+        console.log('============================================================')
         console.warn(`代理获取失败，切换到直连: ${proxyError?.message || proxyError}`)
+        console.log('============================================================\n')
+        // Continue with proxyUrl = null for direct connection
       }
-      // Continue with proxyUrl = null for direct connection
+    } else if (!useProxy) {
+      // Only log once per window when switching to direct mode
+      if (sessionProxyMap.has(key)) {
+        console.log('============================================================')
+      console.log(`[${new Date().toLocaleTimeString()}] 窗口 ${key} 切换到直连模式`)
+      console.log('============================================================\n')
+        sessionProxyMap.delete(key)
+        sessionHistory.delete(key)
+      }
     }
     
     // 根据配置选择合适的代理Agent
@@ -359,41 +606,83 @@ app.use('/grab', async (req, res, next) => {
         'Connection': 'keep-alive',
       },
       onError(err, req2, res2) {
+        const now = new Date().toLocaleTimeString()
+        console.log('============================================================')
+        
+        let needForceSwitch = false
         if (config.enableProxy && entry) {
-          console.warn(`[${entry.proxyIp}] 请求错误，尝试轮换代理: ${err?.message || err}`)
+          console.warn(`[${now}][${entry.proxyIp}] 请求错误: ${err?.message || err}`)
+          
+          // Track error and check if force switch is needed
+          const statusCode = err?.response?.status || (err?.code === 'ECONNABORTED' ? 500 : null)
+          needForceSwitch = trackRequestError(key, err, statusCode)
+        } else {
+          console.warn(`[${now}] 直连请求错误: ${err?.message || err}`)
         }
-        ensureProxyFresh(key, true).then((newEntry) => {
-          const purl = newEntry?.url
-          let Agent2, agent2
-          if (purl) {
-            const scheme = config.upstream?.proxyScheme || 'http'
-            switch (scheme) {
-              case 'socks5':
-                Agent2 = SocksProxyAgent
-                agent2 = new Agent2(purl)
-                break
-              case 'https':
-                Agent2 = HttpsProxyAgent
-                agent2 = new Agent2(purl, { rejectUnauthorized: false })
-                break
-              case 'http':
-              default:
-                Agent2 = HttpProxyAgent
-                agent2 = new Agent2(purl)
-                break
+        console.log('============================================================\n')
+        
+        // Force switch if consecutive errors threshold reached
+        if (needForceSwitch) {
+          forceSwitchProxy(key, '连续错误').then((newEntry) => {
+            if (newEntry) {
+              // Don't retry the failed request, just switch proxy for future requests
+              res2.statusCode = 502
+              res2.end('Bad Gateway: proxy switched due to consecutive errors')
+            } else {
+              res2.statusCode = 502
+              res2.end('Bad Gateway: proxy switch failed')
             }
-          }
-          return createProxyMiddleware({ 
-            target: TARGET, 
-            changeOrigin: true, 
-            secure: false, 
-            logLevel: 'silent', 
-            pathRewrite: { '^/grab': '' }, 
-            agent: agent2,
-            headers: { 'Connection': 'keep-alive' }
-          })(req2, res2, next)
-        }).catch((retryError) => {
-          console.warn('代理重试失败，切换到直连')
+          })
+          return
+        }
+        
+        // Normal error retry (not consecutive error threshold)
+        if (useProxy) {
+          ensureProxyFresh(key, true).then((newEntry) => {
+            const purl = newEntry?.url
+            let Agent2, agent2
+            if (purl) {
+              const scheme = config.upstream?.proxyScheme || 'http'
+              switch (scheme) {
+                case 'socks5':
+                  Agent2 = SocksProxyAgent
+                  agent2 = new Agent2(purl)
+                  break
+                case 'https':
+                  Agent2 = HttpsProxyAgent
+                  agent2 = new Agent2(purl, { rejectUnauthorized: false })
+                  break
+                case 'http':
+                default:
+                  Agent2 = HttpProxyAgent
+                  agent2 = new Agent2(purl)
+                  break
+              }
+            }
+            return createProxyMiddleware({ 
+              target: TARGET, 
+              changeOrigin: true, 
+              secure: false, 
+              logLevel: 'silent', 
+              pathRewrite: { '^/grab': '' }, 
+              agent: agent2,
+              headers: { 'Connection': 'keep-alive' }
+            })(req2, res2, next)
+          }).catch((retryError) => {
+            console.log('============================================================')
+            console.warn(`[${now}] 代理重试失败，切换到直连`)
+            console.log('============================================================\n')
+            return createProxyMiddleware({ 
+              target: TARGET, 
+              changeOrigin: true, 
+              secure: false, 
+              logLevel: 'silent', 
+              pathRewrite: { '^/grab': '' },
+              headers: { 'Connection': 'keep-alive' }
+            })(req2, res2, next)
+          })
+        } else {
+          // Direct connection retry
           return createProxyMiddleware({ 
             target: TARGET, 
             changeOrigin: true, 
@@ -402,9 +691,11 @@ app.use('/grab', async (req, res, next) => {
             pathRewrite: { '^/grab': '' },
             headers: { 'Connection': 'keep-alive' }
           })(req2, res2, next)
-        })
+        }
       },
       onProxyReq: (proxyReq, req, res) => {
+        const now = new Date().toLocaleTimeString()
+        
         // 确保正确的请求头
         if (!proxyReq.getHeader('Content-Type') && req.method === 'POST') {
           proxyReq.setHeader('Content-Type', 'application/json')
@@ -420,20 +711,40 @@ app.use('/grab', async (req, res, next) => {
         const targetUrl = new URL(TARGET)
         proxyReq.setHeader('Host', targetUrl.host)
         
-        // 如果使用代理，添加代理相关的调试信息
+        // 实时日志 (仅代理模式)
         if (config.enableProxy && entry) {
-          console.log(`[${entry.proxyIp}] 发送请求: ${req.method} ${proxyReq.path}`)
+          console.log('============================================================')
+          console.log(`[${now}][${entry.proxyIp}] 发送请求: ${req.method} ${proxyReq.path}`)
+          console.log('============================================================\n')
+        }
+        // 直连模式只统计不打印实时日志
+        if (!entry) {
+          directConnectionCount++
         }
       },
       onProxyRes: (proxyRes, req, res) => {
-        // Log response for active proxies
+        // Reset consecutive errors on successful response (status < 500)
+        if (config.enableProxy && entry && proxyRes.statusCode < 500) {
+          if (entry.consecutiveErrors > 0) {
+            console.log('============================================================')
+            console.log(`[${entry.proxyIp}] 成功响应 (${proxyRes.statusCode})，清除连续错误计数`)
+            console.log('============================================================\n')
+            entry.consecutiveErrors = 0
+          }
+        }
+        
+        // Real-time response logging
         if (config.enableProxy && entry) {
           let responseData = ''
+          const chunks = []
+          
           proxyRes.on('data', (chunk) => {
-            responseData += chunk
+            chunks.push(chunk)
           })
+          
           proxyRes.on('end', () => {
             try {
+              responseData = Buffer.concat(chunks).toString()
               const jsonData = JSON.parse(responseData)
               logRequest(key, entry.proxyIp, jsonData)
             } catch {
@@ -442,12 +753,14 @@ app.use('/grab', async (req, res, next) => {
             }
           })
         }
+        // 直连模式不打印实时响应日志，仅在30s报告中显示统计
       }
     })(req, res, next)
   } catch (e) {
-    if (config.enableProxy) {
-      console.warn('代理中间件设置失败，切换到直连')
-    }
+    const now = new Date().toLocaleTimeString()
+    console.log('============================================================')
+    console.warn(`[${now}] 代理中间件设置失败，切换到直连`)
+    console.log('============================================================\n')
     return createProxyMiddleware({
       target: TARGET,
       changeOrigin: true,
@@ -459,13 +772,41 @@ app.use('/grab', async (req, res, next) => {
   }
 })
 
+// Proxy control endpoint for frontend
+app.get('/proxy-control', (req, res) => {
+  res.json({
+    enableProxy: config.enableProxy || false,
+    currentSessions: sessionProxyMap.size,
+    uptime: Math.floor((Date.now() - lastStatusTime) / 1000)
+  })
+})
+
+app.post('/proxy-control', (req, res) => {
+  const { enableProxy } = req.body || {}
+  if (typeof enableProxy === 'boolean') {
+    config.enableProxy = enableProxy
+    console.log('============================================================')
+    console.log(`[${new Date().toLocaleTimeString()}] 代理功能已${enableProxy ? '启用' : '禁用'}`)
+    console.log('============================================================\n')
+    if (!enableProxy) {
+      // Clear all proxy sessions when disabled
+      sessionProxyMap.clear()
+      sessionHistory.clear()
+    }
+    res.json({ success: true, enableProxy: config.enableProxy })
+  } else {
+    res.status(400).json({ error: 'Invalid enableProxy value' })
+  }
+})
+
 app.listen(PORT, () => {
+  console.log('============================================================')
   console.log(`代理服务器启动: http://localhost:${PORT}`)
   console.log(`目标服务器: ${TARGET}`)
   console.log(`代理功能: ${config.enableProxy ? '已启用' : '已禁用 (直连模式)'}`)
   console.log(`健康检查: http://localhost:${PORT}/healthz`)
   console.log(`代理状态: http://localhost:${PORT}/proxy-status`)
-  console.log('='.repeat(50))
+  console.log('============================================================\n')
   
   // Initial proxy status
   logProxyUsage()

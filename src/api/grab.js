@@ -3,7 +3,7 @@ import axios from 'axios'
 let grabToken = ''
 let grabUid = ''
 
-// Per-window proxy key
+// Per-window proxy key and settings
 let windowProxyKey = ''
 function getWindowProxyKey() {
   try {
@@ -20,6 +20,28 @@ function getWindowProxyKey() {
     }
     return windowProxyKey
   }
+}
+
+function getUseProxy() {
+  try {
+    const USE_PROXY_KEY = 'useProxy'
+    const stored = sessionStorage.getItem(USE_PROXY_KEY)
+    return stored !== 'false' // default true unless explicitly false
+  } catch {
+    return true // default true
+  }
+}
+
+export function setUseProxy(useProxy) {
+  try {
+    sessionStorage.setItem('useProxy', String(useProxy))
+  } catch {}
+}
+
+export function toggleUseProxy() {
+  const current = getUseProxy()
+  setUseProxy(!current)
+  return !current
 }
 
 export function setGrabAuthToken(token) {
@@ -45,6 +67,8 @@ grab.interceptors.request.use((config) => {
   config.headers['AppPlatform'] = 'H5'
   // Per-window proxy routing header
   config.headers['x-proxy-key'] = getWindowProxyKey()
+  // Per-window proxy toggle
+  config.headers['x-use-proxy'] = String(getUseProxy())
   if (grabUid) {
     config.headers['uid'] = grabUid
   }

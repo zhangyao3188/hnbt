@@ -1,5 +1,8 @@
 // Config for local proxy server and upstream proxy acquisition
 export default {
+  // Enable/disable proxy functionality (can be toggled at runtime)
+  enableProxy: true,
+
   // Port for local express proxy server
   serverPort: 5179,
 
@@ -29,6 +32,18 @@ export default {
     // Whether to validate newly acquired proxy by sending a test request to target
     // Set to false if target server doesn't support HEAD requests or causes 405 errors
     validateOnAcquire: false,
+  },
+
+  // Proxy quality monitoring settings
+  qualityMonitoring: {
+    // 连续错误次数阈值 (HTTP 500 + 超时)
+    consecutiveErrorThreshold: 5,
+    
+    // 30s内最低请求次数阈值 (低于此值视为性能差)
+    performanceRequestThreshold: 15,
+    
+    // 连续性能异常次数阈值
+    performanceAnomalyThreshold: 2,
   },
 }
 

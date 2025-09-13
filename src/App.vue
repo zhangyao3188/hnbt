@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import request, { setAuthToken } from './api/request'
-import grab, { setGrabAuthToken, setGrabUid } from './api/grab'
+import grab, { setGrabAuthToken, setGrabUid, setUseProxy, toggleUseProxy } from './api/grab'
 import successSoundUrl from '../assets/music.mp3'
 
 // Server酱推送配置（页面可填写，默认读取本地缓存）
@@ -48,22 +48,24 @@ async function sendTestPush() {
   }
 }
 
-async function sendPushOnSuccess({ name, phone, quota, time, uniqueId }) {
+async function sendPushOnSuccess({ name, phone, quota, time, uniqueId, isDuplicate = false }) {
   if (!SCT_SEND_URL.value) {
     addLog('未配置Server酱推送Key，已跳过推送')
     return
   }
   try {
-    const title = `抢购成功或重复提交-${name || '用户'}-${quota}`.slice(0, 32)
+    const titlePrefix = isDuplicate ? '重复提交' : '抢购成功'
+    const title = `${titlePrefix}-${name || '用户'}-${quota}`.slice(0, 32)
     const lines = [
       `账号：${phone || ''}`,
       `姓名：${name || ''}`,
       `档位：${quota || ''}`,
       `时间：${time || new Date().toLocaleString()}`,
-      `uniqueId：${uniqueId || ''}`
+      `uniqueId：${uniqueId || ''}`,
+      `状态：${isDuplicate ? '重复提交（已在其他渠道成功）' : '首次提交成功'}`
     ]
     const desp = lines.join('\n')
-    const shortText = `成功 ${quota} | ${name || ''} ${phone || ''}`.slice(0, 64)
+    const shortText = `${isDuplicate ? '重复' : '成功'} ${quota} | ${name || ''} ${phone || ''}`.slice(0, 64)
     const payload = { title, desp, short: shortText, noip: 1, channel: '9' }
     const res = await fetch(SCT_SEND_URL.value, {
       method: 'POST',
@@ -223,6 +225,24 @@ const quotaTemp = ref(800)
 const uniqueId = ref('')
 const isPurchasing = ref(false)
 const aborted = ref(false)
+
+// Proxy control state
+const useProxyForWindow = ref(true)
+
+function initProxyState() {
+  try {
+    const stored = sessionStorage.getItem('useProxy')
+    useProxyForWindow.value = stored !== 'false'
+  } catch {
+    useProxyForWindow.value = true
+  }
+}
+
+function onToggleProxy() {
+  const newValue = toggleUseProxy()
+  useProxyForWindow.value = newValue
+  addLog(`代理设置：${newValue ? '启用代理IP' : '使用直连IP'}`)
+}
 
 // Logs
 const logs = ref([])
@@ -531,6 +551,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 async function getPositionsWithRetry() {
   let attempts = 0
+  addLog(`🔍 开始获取档位信息，目标补贴：${selectedQuota.value}`)
+  
   while (true) {
     if (aborted.value) throw new Error('已停止')
     attempts++
@@ -540,18 +562,25 @@ async function getPositionsWithRetry() {
       const match = list.find(x => Number(x.subsidyAmount) === Number(selectedQuota.value))
       const foodList = res?.data?.foodSubsidyPositions || []
       let foodId = null
+      
       if (Array.isArray(foodList) && foodList.length > 0) {
         const maxFood = foodList.reduce((a, b) => Number(a.subsidyAmount) >= Number(b.subsidyAmount) ? a : b)
         foodId = maxFood?.id ?? null
-        addLog(`餐饮档位选择：id=${foodId}，补贴=${maxFood?.subsidyAmount}${res?.message ? '：'+res.message : ''}`)
+        addLog(`🍽️ 餐饮档位选择：id=${foodId}，补贴=${maxFood?.subsidyAmount}${res?.message ? '：'+res.message : ''}`)
       }
+      
       if (match) {
-        addLog(`旅游档位匹配成功，id=${match.id}${res?.message ? '：'+res.message : ''}`)
+        addLog(`✅ 旅游档位匹配成功！id=${match.id}，补贴=${match.subsidyAmount}${res?.message ? '：'+res.message : ''}`)
         return { tourismId: match.id, foodId }
       }
-      if (attempts % 20 === 1) addLog(`档位未就绪，重试中...${res?.message ? '（'+res.message+'）' : ''}`)
+      
+      if (attempts % 20 === 1) {
+        addLog(`⏳ 档位未就绪，继续等待... (第${attempts}次尝试) ${res?.message ? '（'+res.message+'）' : ''}`)
+      }
     } catch (e) {
-      if (attempts % 20 === 1) addLog(`获取档位失败，重试中... ${e.message || e}`)
+      if (attempts % 20 === 1) {
+        addLog(`❌ 获取档位失败，继续重试... (第${attempts}次尝试) ${e.message || e}`)
+      }
     }
     await sleep(200)
   }
@@ -559,6 +588,8 @@ async function getPositionsWithRetry() {
 
 async function getTicketWithRetry() {
   let attempts = 0
+  addLog('🎫 开始获取入场票据...')
+  
   while (true) {
     if (aborted.value) throw new Error('已停止')
     attempts++
@@ -566,19 +597,22 @@ async function getTicketWithRetry() {
       const res = await grab.get('/hyd-queue/core/simple/entry')
       const ticket = res?.data?.ticket
       if (ticket) {
+        addLog(`🎫 获取到票据，正在校验...`)
         // validate ticket
         const check = await grab.post('/ai-smart-subsidy-approval/api/queue/ticket/check', { ticket })
         if (check?.success) {
-          addLog(`获取并校验ticket成功${check?.message ? '：'+check.message : ''}`)
+          addLog(`✅ 票据校验通过！${check?.message ? '：'+check.message : ''}`)
           return ticket
         } else {
-          addLog(`ticket校验未通过${check?.message ? '：'+check.message : ''}，重试获取`)
+          addLog(`❌ 票据校验未通过${check?.message ? '：'+check.message : ''}，重新获取`)
         }
       } else if (attempts % 20 === 1) {
-        addLog(`ticket未就绪，重试中...${res?.message ? '（'+res.message+'）' : ''}`)
+        addLog(`⏳ 票据未就绪，继续等待... (第${attempts}次尝试) ${res?.message ? '（'+res.message+'）' : ''}`)
       }
     } catch (e) {
-      if (attempts % 20 === 1) addLog(`获取/校验ticket失败，重试中... ${e.message || e}`)
+      if (attempts % 20 === 1) {
+        addLog(`❌ 获取/校验票据失败，继续重试... (第${attempts}次尝试) ${e.message || e}`)
+      }
     }
     await sleep(200)
   }
@@ -597,21 +631,39 @@ async function submitApplyWithRetry({ uniqueIdVal, positionId, ticket, foodSubsi
     if (aborted.value) throw new Error('已停止')
     attempts++
     try {
+      addLog(`正在提交申请... (第${attempts}次尝试)`)
       const res = await submitApplyOnce({ uniqueIdVal, positionId, ticket: currentTicket, foodSubsidyId })
-      if (res?.success || res?.message.includes("重复提交")) {
-        addLog(res?.success ? `提交成功！${res?.message ? res.message : '抢购成功'}` : `用户已经在其他渠道提交成功：${res?.message}`)
-        return true
+      
+      // 判断是否成功或重复提交
+      const isSuccess = res?.success === true
+      const isDuplicate = !isSuccess && res?.message && res.message.includes("重复提交")
+      
+      if (isSuccess) {
+        addLog(`🎉 抢购成功！${res?.message || ''}`)
+        return { success: true, isDuplicate: false }
+      } else if (isDuplicate) {
+        addLog(`⚠️ 重复提交：用户已在其他渠道提交成功 - ${res?.message || ''}`)
+        return { success: true, isDuplicate: true }
       }
+      
+      // 处理其他错误情况
       const msg = res?.message || ''
       const code = res?.code || ''
+      
       if (code === 'TICKET_INVALID' || /票据无效|过期/.test(msg)) {
-        addLog(`ticket无效/过期，重新获取ticket重试... ${code ? '['+code+'] ' : ''}${msg}`)
+        addLog(`🔄 ticket无效/过期，重新获取ticket... ${code ? '['+code+'] ' : ''}${msg}`)
         currentTicket = await getTicketWithRetry()
         continue
       }
-      if (attempts % 10 === 1) addLog(`提交失败，重试中... ${code ? '['+code+'] ' : ''}${msg || '未知'}`)
+      
+      // 记录失败日志
+      if (attempts % 10 === 1) {
+        addLog(`❌ 提交失败，继续重试... ${code ? '['+code+'] ' : ''}${msg || '未知错误'}`)
+      }
     } catch (e) {
-      if (attempts % 10 === 1) addLog(`提交异常，重试中... ${e.message || e}`)
+      if (attempts % 10 === 1) {
+        addLog(`💥 提交异常，继续重试... ${e.message || e}`)
+      }
     }
     await sleep(200)
   }
@@ -628,13 +680,26 @@ async function startGrab() {
   }
   aborted.value = false
   isPurchasing.value = true
+  addLog(`🚀 开始抢购流程，档位：${selectedQuota.value}`)
+  
   try {
+    addLog('📋 确保uniqueId已获取...')
     await ensureUniqueId()
+    
+    addLog('🎯 获取档位信息...')
     const { tourismId, foodId } = await getPositionsWithRetry()
+    
+    addLog('🎫 获取入场票据...')
     const ticket = await getTicketWithRetry()
-    const success = await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
-    if (success) {
+    
+    addLog('📤 开始提交申请...')
+    const result = await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
+    
+    if (result?.success) {
+      // 播放成功音效
       playSuccessAudioOnce()
+      
+      // 发送推送通知
       if (SCT_SEND_URL.value) {
         await sendPushOnSuccess({
           name: user.value?.name || '用户',
@@ -642,13 +707,17 @@ async function startGrab() {
           quota: selectedQuota.value,
           time: new Date().toLocaleString(),
           uniqueId: uniqueId.value,
+          isDuplicate: result.isDuplicate || false
         })
       }
+      
+      addLog(`✅ 抢购流程完成！状态：${result.isDuplicate ? '重复提交' : '首次成功'}`)
     }
   } catch (e) {
-    addLog(`抢购流程异常：${e.message || e}`)
+    addLog(`💥 抢购流程异常：${e.message || e}`)
   } finally {
     isPurchasing.value = false
+    addLog('🏁 抢购流程结束')
   }
 }
 
@@ -745,6 +814,9 @@ function onStopAll() {
 onMounted(async () => {
   // prepare success audio element
   prepareSuccessAudio()
+  
+  // initialize proxy state
+  initProxyState()
 
   // Load accounts first
   try {
@@ -844,6 +916,12 @@ onBeforeUnmount(() => {
       <h2>抢购控制</h2>
       <div class="control-stack">
         <div class="time-row">设备时间：{{ deviceTimeText }}</div>
+        <div class="row">
+          <label class="proxy-toggle">
+            <input type="checkbox" v-model="useProxyForWindow" @change="onToggleProxy" />
+            <span>使用代理IP（当前窗口）</span>
+          </label>
+        </div>
         <label class="label">开始时间</label>
         <input class="input time-input" type="time" step="1" v-model="startTime" />
         <div class="row">
@@ -851,6 +929,7 @@ onBeforeUnmount(() => {
           <button class="btn" @click="onStopAll" :disabled="!(isCounting || isPurchasing)">停止</button>
         </div>
         <div class="hint" v-if="selectedQuota">已选择档位：{{ selectedQuota }}</div>
+        <div class="hint">网络模式：{{ useProxyForWindow ? '代理IP' : '直连IP（本机IP）' }}</div>
       </div>
       <div class="countdown" v-if="isCounting">
         倒计时：{{ countdownText }}
@@ -1140,6 +1219,8 @@ h2 {
   border: 1px solid var(--c-border);
   border-radius: 10px;
   padding: 1rem;
+  max-height: 500px;
+  overflow: auto;
 }
 
 .modal-title {
@@ -1214,5 +1295,18 @@ textarea.input {
 
 .acc-phone {
   color: var(--c-muted);
+}
+
+.proxy-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.proxy-toggle input[type="checkbox"] {
+  width: auto;
+  margin: 0;
 }
 </style>
