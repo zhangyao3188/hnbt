@@ -75,11 +75,27 @@ async function acquireProxy() {
   const timer = setTimeout(() => ac.abort(), timeoutMs)
   try {
     const res = await fetch(url, { signal: ac.signal })
+    const bodyText = await res.text().catch(() => '')
     if (!res.ok) {
+      console.warn(`[proxy] provider HTTP ${res.status}: ${res.statusText}; body=${(bodyText || '').slice(0, 300)}`)
       throw new Error(`provider HTTP ${res.status}: ${res.statusText}`)
     }
-    const json = await res.json()
-    const { proxyUrl, safeExpireTs, proxyIp } = parseProviderResponse(json)
+    let json
+    try {
+      json = bodyText ? JSON.parse(bodyText) : {}
+    } catch (e) {
+      console.warn('[proxy] provider returned non-JSON body:', (bodyText || '').slice(0, 300))
+      throw new Error('provider returned non-JSON body')
+    }
+    let parsed
+    try {
+      parsed = parseProviderResponse(json)
+    } catch (e) {
+      // Print full provider response for diagnosis (e.g., 未在白名单)
+      console.warn('[proxy] provider response (failure):', JSON.stringify(json))
+      throw e
+    }
+    const { proxyUrl, safeExpireTs, proxyIp } = parsed
     if (config.upstream?.validateOnAcquire) {
       await validateProxy(proxyUrl)
     }
