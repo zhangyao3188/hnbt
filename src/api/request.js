@@ -8,7 +8,7 @@ export function setAuthToken(token) {
 
 const request = axios.create({
   baseURL: '/api/noauth',
-  timeout: 15000,
+  timeout: 60000,
   withCredentials: false,
 })
 

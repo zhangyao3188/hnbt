@@ -3,6 +3,25 @@ import axios from 'axios'
 let grabToken = ''
 let grabUid = ''
 
+// Per-window proxy key
+let windowProxyKey = ''
+function getWindowProxyKey() {
+  try {
+    const KEY = 'proxyKey'
+    const exist = sessionStorage.getItem(KEY)
+    if (exist) return exist
+    const random = Math.random().toString(36).slice(2) + Date.now().toString(36)
+    sessionStorage.setItem(KEY, random)
+    return random
+  } catch {
+    // Fallback if sessionStorage unavailable
+    if (!windowProxyKey) {
+      windowProxyKey = Math.random().toString(36).slice(2)
+    }
+    return windowProxyKey
+  }
+}
+
 export function setGrabAuthToken(token) {
   grabToken = token || ''
 }
@@ -13,7 +32,7 @@ export function setGrabUid(uid) {
 
 const grab = axios.create({
   baseURL: '/grab',
-  timeout: 15000,
+  timeout: 60000,
   withCredentials: false,
 })
 
@@ -24,6 +43,8 @@ grab.interceptors.request.use((config) => {
   }
   // Fixed platform header
   config.headers['AppPlatform'] = 'H5'
+  // Per-window proxy routing header
+  config.headers['x-proxy-key'] = getWindowProxyKey()
   if (grabUid) {
     config.headers['uid'] = grabUid
   }

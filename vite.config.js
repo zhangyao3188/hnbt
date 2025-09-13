@@ -14,10 +14,10 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
       '/grab': {
-        target: 'https://ai-smart-subsidy-backend.digitalhainan.com.cn',
+        target: 'http://localhost:5179',
         changeOrigin: true,
-        secure: true,
-        rewrite: (path) => path.replace(/^\/grab/, ''),
+        secure: false,
+        // 保留 /grab 前缀，由本地 Node 代理再去移除
       },
     },
   },

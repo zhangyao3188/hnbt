@@ -2,6 +2,7 @@
 import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import request, { setAuthToken } from './api/request'
 import grab, { setGrabAuthToken, setGrabUid } from './api/grab'
+import successSoundUrl from '../assets/music.mp3'
 
 // Server酱推送配置（页面可填写，默认读取本地缓存）
 const sctKey = ref(localStorage.getItem('sctKey') || '')
@@ -82,6 +83,128 @@ const smsCode = ref('')
 const isLoggingIn = ref(false)
 const user = ref(null) // { id, phone(masked), name, token, accId? }
 
+// ===== Multi-accounts =====
+const accounts = ref([]) // [{ id, name, phone, token, accId, grabToken, ticketSNO, uniqueId, createdAt }]
+const activeAccountId = ref('')
+const accountsVisible = ref(false)
+
+function persistAccounts() {
+  try {
+    localStorage.setItem('accounts', JSON.stringify(accounts.value || []))
+    localStorage.setItem('activeAccountId', activeAccountId.value || '')
+  } catch {}
+}
+
+function maskPhone(p) {
+  return (p || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')
+}
+
+function upsertAccount(partial) {
+  const id = partial.id || partial.phone || (partial.token ? partial.token.slice(-8) : Math.random().toString(36).slice(2))
+  const idx = accounts.value.findIndex(a => a.id === id || (partial.phone && a.phone === partial.phone) || (partial.token && a.token === partial.token))
+  const base = {
+    id,
+    name: partial.name || '用户',
+    phone: partial.phone || '',
+    token: partial.token || '',
+    accId: partial.accId || '',
+    grabToken: partial.grabToken || '',
+    ticketSNO: partial.ticketSNO || '',
+    uniqueId: partial.uniqueId || '',
+    createdAt: partial.createdAt || Date.now()
+  }
+  if (idx >= 0) {
+    accounts.value[idx] = { ...accounts.value[idx], ...base }
+    persistAccounts()
+    return accounts.value[idx]
+  } else {
+    accounts.value.push(base)
+    persistAccounts()
+    return base
+  }
+}
+
+function applyActiveAccount(acc) {
+  if (!acc) return
+  // sync runtime user
+  user.value = {
+    id: acc.id,
+    phone: maskPhone(acc.phone),
+    name: acc.name || '用户',
+    token: acc.token || '',
+    accId: acc.accId || ''
+  }
+  // sync tokens to API modules
+  setAuthToken(acc.token || '')
+  setGrabAuthToken(acc.grabToken || '')
+  if (acc.accId) setGrabUid(acc.accId)
+  // sync runtime uniqueId
+  uniqueId.value = acc.uniqueId || ''
+  // keep legacy single-account storage for backward compatibility and导出
+  localStorage.setItem('auth', JSON.stringify({ name: acc.name || '用户', token: acc.token || '', phone: acc.phone || '' }))
+  if (acc.accId) localStorage.setItem('accId', acc.accId)
+  if (acc.ticketSNO) localStorage.setItem('ticketSNO', acc.ticketSNO)
+  if (acc.grabToken) localStorage.setItem('grabToken', acc.grabToken)
+  if (acc.uniqueId) localStorage.setItem('uniqueId', acc.uniqueId)
+}
+
+function switchAccount(id) {
+  const acc = accounts.value.find(a => a.id === id)
+  if (!acc) return
+  activeAccountId.value = acc.id
+  persistAccounts()
+  applyActiveAccount(acc)
+  addLog(`已切换账号：${acc.name || ''} ${maskPhone(acc.phone)}`)
+  // refresh grab token if missing and fetch uniqueId for this account
+  refreshGrabAuthAndUniqueId()
+}
+
+function deleteAccount(id) {
+  const idx = accounts.value.findIndex(a => a.id === id)
+  if (idx < 0) return
+  const removed = accounts.value.splice(idx, 1)[0]
+  addLog(`已删除账号：${removed?.name || ''} ${maskPhone(removed?.phone)}`)
+  if (activeAccountId.value === id) {
+    const next = accounts.value[0]
+    if (next) {
+      activeAccountId.value = next.id
+      applyActiveAccount(next)
+    } else {
+      // no accounts left → clear runtime tokens
+      onLogout()
+      activeAccountId.value = ''
+    }
+  }
+  persistAccounts()
+}
+
+function openAccounts() { accountsVisible.value = true }
+function closeAccounts() { accountsVisible.value = false }
+
+// Refresh grab token (if missing) and uniqueId for current active account, then persist
+async function refreshGrabAuthAndUniqueId() {
+  try {
+    // if not have grabToken, try exchange
+    if (!localStorage.getItem('grabToken') && user.value?.token) {
+      await exchangeGrabToken()
+    }
+    await fetchUniqueId()
+    // write back to active account
+    const idx = accounts.value.findIndex(a => a.id === activeAccountId.value)
+    if (idx >= 0) {
+      accounts.value[idx] = {
+        ...accounts.value[idx],
+        grabToken: localStorage.getItem('grabToken') || accounts.value[idx].grabToken || '',
+        ticketSNO: localStorage.getItem('ticketSNO') || accounts.value[idx].ticketSNO || '',
+        uniqueId: uniqueId.value || accounts.value[idx].uniqueId || ''
+      }
+      persistAccounts()
+    }
+  } catch (e) {
+    addLog(`刷新uniqueId失败：${e?.message || e}`)
+  }
+}
+
 // Captcha & SMS state (modal flow)
 const captchaImage = ref('') // data URL
 const imageKey = ref('')
@@ -111,6 +234,44 @@ function addLog(message) {
 
 function clearLogs() {
   logs.value = []
+}
+
+// ===== Success sound =====
+let successAudio = null
+
+function prepareSuccessAudio() {
+  try {
+    if (!successAudio) {
+      successAudio = new Audio(successSoundUrl)
+      successAudio.preload = 'auto'
+    }
+  } catch {}
+}
+
+function unlockSuccessAudio() {
+  try {
+    prepareSuccessAudio()
+    if (!successAudio || successAudio._unlocked) return
+    successAudio.muted = true
+    const p = successAudio.play()
+    if (p && typeof p.then === 'function') {
+      p.then(() => {
+        successAudio.pause()
+        successAudio.currentTime = 0
+        successAudio.muted = false
+        successAudio._unlocked = true
+      }).catch(() => {})
+    }
+  } catch {}
+}
+
+async function playSuccessAudioOnce() {
+  try {
+    prepareSuccessAudio()
+    if (!successAudio) return
+    successAudio.currentTime = 0
+    await successAudio.play().catch(() => {})
+  } catch {}
 }
 
 async function onExportUser() {
@@ -160,34 +321,15 @@ async function onConfirmImport() {
     const uniq = obj.uniqueId || ''
 
     if (token) {
-      setAuthToken(token)
-      localStorage.setItem('auth', JSON.stringify({ name, token, phone: phoneRaw }))
-      user.value = {
-        id: Math.random().toString(36).slice(2, 8),
-        phone: (phoneRaw || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
-        name,
-        token,
-        accId: accId || user.value?.accId || ''
-      }
-    }
-    if (accId) {
-      setGrabUid(accId)
-      localStorage.setItem('accId', accId)
-    }
-    if (ticketSNO) {
-      localStorage.setItem('ticketSNO', ticketSNO)
-    }
-    if (grabToken) {
-      setGrabAuthToken(grabToken)
-      localStorage.setItem('grabToken', grabToken)
-    }
-    if (uniq) {
-      uniqueId.value = String(uniq)
-      localStorage.setItem('uniqueId', uniqueId.value)
+      const acc = upsertAccount({ name, token, phone: phoneRaw, accId, ticketSNO, grabToken, uniqueId: String(uniq || '') })
+      activeAccountId.value = acc.id
+      persistAccounts()
+      applyActiveAccount(acc)
+      await refreshGrabAuthAndUniqueId()
     }
 
     importVisible.value = false
-    addLog('导入完成，已写入本地缓存并同步到运行状态')
+    addLog('导入完成：已加入账号列表，并切换为当前账号')
   } catch (e) {
     addLog(`导入失败：${e.message || e}`)
   }
@@ -319,23 +461,25 @@ async function onLogin() {
     if (!token) {
       throw new Error('登录返回缺少token')
     }
-    user.value = {
-      id: Math.random().toString(36).slice(2, 8),
-      phone: phone.value.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
-      name,
-      token,
-      accId
-    }
-    setAuthToken(token)
-    if (accId) {
-      setGrabUid(accId)
-      localStorage.setItem('accId', accId)
-    }
-    localStorage.setItem('auth', JSON.stringify({ name, token, phone: phone.value }))
+    const acc = upsertAccount({ name, token, phone: phone.value, accId })
+    activeAccountId.value = acc.id
+    persistAccounts()
+    applyActiveAccount(acc)
     addLog(`登录成功，欢迎：${name}${res?.message ? '：'+res.message : ''}`)
     // exchange second-system token and get uniqueId
     await exchangeGrabToken()
     await fetchUniqueId()
+    // persist latest grabToken/uniqueId back to account
+    const idx = accounts.value.findIndex(a => a.id === activeAccountId.value)
+    if (idx >= 0) {
+      accounts.value[idx] = {
+        ...accounts.value[idx],
+        grabToken: localStorage.getItem('grabToken') || accounts.value[idx].grabToken || '',
+        ticketSNO: localStorage.getItem('ticketSNO') || accounts.value[idx].ticketSNO || '',
+        uniqueId: uniqueId.value || accounts.value[idx].uniqueId || ''
+      }
+      persistAccounts()
+    }
   } catch (e) {
     addLog(`登录失败：${e.message || e}`)
   } finally {
@@ -489,14 +633,17 @@ async function startGrab() {
     const { tourismId, foodId } = await getPositionsWithRetry()
     const ticket = await getTicketWithRetry()
     const success = await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
-    if (success && SCT_SEND_URL.value) {
-      await sendPushOnSuccess({
-        name: user.value?.name || '用户',
-        phone: user.value?.phone || '',
-        quota: selectedQuota.value,
-        time: new Date().toLocaleString(),
-        uniqueId: uniqueId.value,
-      })
+    if (success) {
+      playSuccessAudioOnce()
+      if (SCT_SEND_URL.value) {
+        await sendPushOnSuccess({
+          name: user.value?.name || '用户',
+          phone: user.value?.phone || '',
+          quota: selectedQuota.value,
+          time: new Date().toLocaleString(),
+          uniqueId: uniqueId.value,
+        })
+      }
     }
   } catch (e) {
     addLog(`抢购流程异常：${e.message || e}`)
@@ -543,6 +690,7 @@ function onStartClick() {
     addLog('请先登录再开始抢购')
     return
   }
+  unlockSuccessAudio()
   quotaTemp.value = selectedQuota.value || 800
   quotaVisible.value = true
 }
@@ -595,33 +743,38 @@ function onStopAll() {
 }
 
 onMounted(async () => {
-  const saved = localStorage.getItem('auth')
-  if (saved) {
-    try {
-      const parsed = JSON.parse(saved)
-      if (parsed?.token) {
-        user.value = {
-          id: Math.random().toString(36).slice(2, 8),
-          phone: (parsed.phone || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
-          name: parsed.name || '用户',
-          token: parsed.token,
-          accId: localStorage.getItem('accId') || ''
+  // prepare success audio element
+  prepareSuccessAudio()
+
+  // Load accounts first
+  try {
+    const savedAccounts = JSON.parse(localStorage.getItem('accounts') || '[]')
+    if (Array.isArray(savedAccounts)) accounts.value = savedAccounts
+    activeAccountId.value = localStorage.getItem('activeAccountId') || ''
+  } catch {}
+
+  if (accounts.value.length === 0) {
+    // migrate legacy single auth
+    const saved = localStorage.getItem('auth')
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved)
+        if (parsed?.token) {
+          const acc = upsertAccount({ name: parsed.name || '用户', token: parsed.token, phone: parsed.phone || '', accId: localStorage.getItem('accId') || '', grabToken: localStorage.getItem('grabToken') || '', ticketSNO: localStorage.getItem('ticketSNO') || '', uniqueId: localStorage.getItem('uniqueId') || '' })
+          activeAccountId.value = acc.id
         }
-        setAuthToken(parsed.token)
-        const accId = user.value.accId
-        if (accId) setGrabUid(accId)
-        addLog('已恢复登录状态')
-        const savedGrab = localStorage.getItem('grabToken')
-        if (savedGrab) {
-          setGrabAuthToken(savedGrab)
-        } else {
-          await exchangeGrabToken()
-        }
-        uniqueId.value = localStorage.getItem('uniqueId') || ''
-        await fetchUniqueId()
-      }
-    } catch {}
+      } catch {}
+    }
   }
+
+  if (activeAccountId.value) {
+    const acc = accounts.value.find(a => a.id === activeAccountId.value) || accounts.value[0]
+    if (acc) {
+      applyActiveAccount(acc)
+      await refreshGrabAuthAndUniqueId()
+    }
+  }
+
   // device clock every second
   deviceTimeText.value = formatTime(new Date())
   deviceClockId = setInterval(() => {
@@ -676,12 +829,15 @@ onBeforeUnmount(() => {
           <div>姓名：{{ user.name }}</div>
           <div>手机号：{{ user.phone }}</div>
         </div>
-        <button class="btn" @click="onLogout">退出登录</button>
+        <div class="row">
+          <button class="btn" @click="openAccounts">账号列表</button>
+          <button class="btn" @click="onLogout">退出登录</button>
+        </div>
       </div>
       <div v-if="isLoggedIn" class="row">
         <button class="btn small" @click="onExportUser">导出</button>
-        <button class="btn small" @click="openImportUser">导入</button>
       </div>
+      <button class="btn small" @click="openImportUser">导入</button>
     </section>
 
     <section class="panel">
@@ -763,6 +919,31 @@ onBeforeUnmount(() => {
         <div class="modal-actions">
           <button class="btn" @click="importVisible=false">取消</button>
           <button class="btn primary" @click="onConfirmImport">确认导入</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Accounts Modal -->
+    <div v-if="accountsVisible" class="modal-mask" @click.self="closeAccounts()">
+      <div class="modal">
+        <div class="modal-title">账号列表（{{ accounts.length }}）</div>
+        <div class="modal-body">
+          <div v-if="accounts.length===0" class="hint">暂无账号</div>
+          <div v-else class="acc-list">
+            <div class="acc-row" v-for="acc in accounts" :key="acc.id">
+              <div class="acc-info">
+                <div class="acc-name">{{ acc.name }}</div>
+                <div class="acc-phone">{{ (acc.phone || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2') }}</div>
+              </div>
+              <div class="acc-actions">
+                <button class="btn small" :disabled="activeAccountId===acc.id" @click="switchAccount(acc.id)">{{ activeAccountId===acc.id ? '当前' : '切换' }}</button>
+                <button class="btn small" @click="deleteAccount(acc.id)" :disabled="accounts.length<=1 && activeAccountId===acc.id">删除</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" @click="closeAccounts()">关闭</button>
         </div>
       </div>
     </div>
@@ -1005,5 +1186,33 @@ h2 {
 
 textarea.input {
   resize: vertical;
+}
+
+.acc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.acc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem;
+  border: 1px dashed var(--c-border);
+  border-radius: 8px;
+}
+
+.acc-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.acc-name {
+  font-weight: 600;
+}
+
+.acc-phone {
+  color: var(--c-muted);
 }
 </style>
