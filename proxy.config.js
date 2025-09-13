@@ -17,7 +17,7 @@ export default {
     // Provider URL that returns one proxy IP per request
     // Example response:
     // {"count":"1","status":"0","expire":"2025-09-12 23:07:03","list":[{"sever":"112.85.129.251","port":37474,"net_type":2}]}
-    providerUrl: 'https://sch.shanchendaili.com/api.html?action=get_ip&key=HU027700915310840704oqdi&time=5&count=1&type=json&only=0',
+    providerUrl: 'https://sch.shanchendaili.com/api.html?action=get_ip&key=HU027700915310840704oqdi&time=30&count=1&type=json&only=1',
 
     // Scheme of the upstream proxy itself: 'http', 'https', or 'socks5'
     // 使用 SOCKS5 代理协议（通常更稳定）
