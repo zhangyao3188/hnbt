@@ -8,8 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "proxy": "node server.proxy.js",
-    "dev:all": "run-p proxy dev",
-    "test:proxy": "node test-proxy.js"
+    "dev:all": "run-p proxy dev"
   },
   "dependencies": {
     "axios": "^1.11.0",
