@@ -1140,6 +1140,8 @@ h2 {
   border: 1px solid var(--c-border);
   border-radius: 10px;
   padding: 1rem;
+  max-height: 500px;
+  overflow: auto;
 }
 
 .modal-title {
