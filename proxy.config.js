@@ -40,7 +40,7 @@ export default {
     consecutiveErrorThreshold: 5,
     
     // 30s内最低请求次数阈值 (低于此值视为性能差)
-    performanceRequestThreshold: 15,
+    performanceRequestThreshold: 12,
     
     // 连续性能异常次数阈值
     performanceAnomalyThreshold: 2,

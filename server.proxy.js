@@ -467,16 +467,7 @@ function cleanupInactiveProxies() {
   })
 }
 
-// Log request details (real-time)
-function logRequest(key, proxyIp, responseData) {
-  if (config.enableProxy && proxyIp) {
-    console.log('============================================================')
-    const now = new Date().toLocaleTimeString()
-    const truncatedResponse = JSON.stringify(responseData).substring(0, 100)
-    console.log(`[${now}][${proxyIp}]: ${truncatedResponse}${responseData && JSON.stringify(responseData).length > 100 ? '...' : ''}`)
-    console.log('============================================================\n')
-  }
-}
+// Removed logRequest function - logging is now handled directly in onProxyRes
 
 // Background proxy refresh and status scheduler
 function startProxyRefreshScheduler() {
@@ -723,6 +714,38 @@ app.use('/grab', async (req, res, next) => {
         }
       },
       onProxyRes: (proxyRes, req, res) => {
+        // Debug logging for 500 error handling
+        if (proxyRes.statusCode === 500) {
+          console.log('============================================================')
+          console.log(`[DEBUG] 检测到500状态码`)
+          console.log(`[DEBUG] config.enableProxy: ${config.enableProxy}`)
+          console.log(`[DEBUG] entry存在: ${!!entry}`)
+          console.log(`[DEBUG] entry.proxyIp: ${entry?.proxyIp}`)
+          console.log(`[DEBUG] key: ${key}`)
+          console.log('============================================================\n')
+        }
+        
+        // Handle 500 status codes as consecutive errors
+        if (config.enableProxy && entry && proxyRes.statusCode === 500) {
+          console.log('============================================================')
+          console.log(`[${entry.proxyIp}] 开始处理500错误，调用trackRequestError`)
+          console.log('============================================================\n')
+          
+          const needForceSwitch = trackRequestError(key, null, proxyRes.statusCode)
+          if (needForceSwitch) {
+            // Force switch proxy due to consecutive 500 errors
+            forceSwitchProxy(key, '连续500错误').then((newEntry) => {
+              console.log('============================================================')
+              console.log(`[${entry.proxyIp}] 连续500错误达到阈值，已强制切换代理`)
+              console.log('============================================================\n')
+            }).catch(err => {
+              console.log('============================================================')
+              console.warn(`强制切换失败: ${err?.message || err}`)
+              console.log('============================================================\n')
+            })
+          }
+        }
+        
         // Reset consecutive errors on successful response (status < 500)
         if (config.enableProxy && entry && proxyRes.statusCode < 500) {
           if (entry.consecutiveErrors > 0) {
@@ -735,6 +758,10 @@ app.use('/grab', async (req, res, next) => {
         
         // Real-time response logging
         if (config.enableProxy && entry) {
+          const now = new Date().toLocaleTimeString()
+          console.log('============================================================')
+          console.log(`[${now}][${entry.proxyIp}] 响应状态: ${proxyRes.statusCode} ${req.method} ${req.url}`)
+          
           let responseData = ''
           const chunks = []
           
@@ -746,11 +773,17 @@ app.use('/grab', async (req, res, next) => {
             try {
               responseData = Buffer.concat(chunks).toString()
               const jsonData = JSON.parse(responseData)
-              logRequest(key, entry.proxyIp, jsonData)
+              // Log response data details
+              if (jsonData && typeof jsonData === 'object') {
+                const logData = JSON.stringify(jsonData).substring(0, 200)
+                console.log(`[${now}][${entry.proxyIp}] 响应数据: ${logData}${JSON.stringify(jsonData).length > 200 ? '...' : ''}`)
+              }
             } catch {
-              // If not JSON, log raw response
-              logRequest(key, entry.proxyIp, responseData.substring(0, 100))
+              // If not JSON, log raw response (first 100 chars)
+              const logData = responseData.substring(0, 100)
+              console.log(`[${now}][${entry.proxyIp}] 响应数据: ${logData}${responseData.length > 100 ? '...' : ''}`)
             }
+            console.log('============================================================\n')
           })
         }
         // 直连模式不打印实时响应日志，仅在30s报告中显示统计

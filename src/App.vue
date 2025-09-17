@@ -250,6 +250,9 @@ const logs = ref([])
 function addLog(message) {
   const timestamp = new Date().toLocaleTimeString()
   logs.value.unshift(`[${timestamp}] ${message}`)
+  if (logs.value.length > 100) {
+    logs.value.pop()
+  }
 }
 
 function clearLogs() {
