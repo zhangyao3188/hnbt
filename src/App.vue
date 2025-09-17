@@ -3,6 +3,8 @@ import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import request, { setAuthToken } from './api/request'
 import grab, { setGrabAuthToken, setGrabUid, setUseProxy, toggleUseProxy } from './api/grab'
 import successSoundUrl from '../assets/music.mp3'
+import ticketClient from './api/ticket'
+import submitClient from './api/submit'
 
 // Server酱推送配置（页面可填写，默认读取本地缓存）
 const sctKey = ref(localStorage.getItem('sctKey') || '')
@@ -104,6 +106,12 @@ function maskPhone(p) {
 function upsertAccount(partial) {
   const id = partial.id || partial.phone || (partial.token ? partial.token.slice(-8) : Math.random().toString(36).slice(2))
   const idx = accounts.value.findIndex(a => a.id === id || (partial.phone && a.phone === partial.phone) || (partial.token && a.token === partial.token))
+  const normalizeQuotas = (arr) => {
+    try {
+      const set = new Set((arr || []).map(v => Number(v)).filter(v => !Number.isNaN(v)))
+      return Array.from(set)
+    } catch { return [] }
+  }
   const base = {
     id,
     name: partial.name || '用户',
@@ -113,6 +121,7 @@ function upsertAccount(partial) {
     grabToken: partial.grabToken || '',
     ticketSNO: partial.ticketSNO || '',
     uniqueId: partial.uniqueId || '',
+    quotas: normalizeQuotas(partial.quotas),
     createdAt: partial.createdAt || Date.now()
   }
   if (idx >= 0) {
@@ -142,6 +151,9 @@ function applyActiveAccount(acc) {
   if (acc.accId) setGrabUid(acc.accId)
   // sync runtime uniqueId
   uniqueId.value = acc.uniqueId || ''
+  // sync saved quotas to runtime selection
+  selectedQuotas.value = Array.isArray(acc.quotas) ? [...acc.quotas] : []
+  selectedQuota.value = selectedQuotas.value[0] || null
   // keep legacy single-account storage for backward compatibility and导出
   localStorage.setItem('auth', JSON.stringify({ name: acc.name || '用户', token: acc.token || '', phone: acc.phone || '' }))
   if (acc.accId) localStorage.setItem('accId', acc.accId)
@@ -217,11 +229,16 @@ const captchaVisible = ref(false)
 // Export/Import modal state
 const importVisible = ref(false)
 const importText = ref('')
+const importFileName = ref('')
+const importMode = ref('paste') // 'paste' | 'file'
 
 // Purchase related state
 const selectedQuota = ref(null) // 800 or 300
+const selectedQuotas = ref([]) // multi-select: [1500,800,300]
 const quotaVisible = ref(false)
 const quotaTemp = ref(800)
+const quotaTempMulti = ref([])
+const perQuotaConcurrency = ref(5)
 const uniqueId = ref('')
 const isPurchasing = ref(false)
 const aborted = ref(false)
@@ -250,6 +267,9 @@ const logs = ref([])
 function addLog(message) {
   const timestamp = new Date().toLocaleTimeString()
   logs.value.unshift(`[${timestamp}] ${message}`)
+  if (logs.value.length > 100) {
+    logs.value.pop()
+  }
 }
 
 function clearLogs() {
@@ -305,7 +325,8 @@ async function onExportUser() {
       accId: localStorage.getItem('accId') || '',
       ticketSNO: localStorage.getItem('ticketSNO') || '',
       grabToken: localStorage.getItem('grabToken') || '',
-      uniqueId: localStorage.getItem('uniqueId') || ''
+      uniqueId: localStorage.getItem('uniqueId') || '',
+      quotas: user.value?.quotas || [] // Include quotas in export
     }
     const text = JSON.stringify(data, null, 2)
     if (navigator.clipboard?.writeText) {
@@ -324,7 +345,99 @@ async function onExportUser() {
   }
 }
 
+async function onExportAllAccounts() {
+  try {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      accounts: (accounts.value || []).map(a => ({
+        id: a.id,
+        name: a.name || '用户',
+        phone: a.phone || '',
+        token: a.token || '',
+        accId: a.accId || '',
+        ticketSNO: a.ticketSNO || '',
+        grabToken: a.grabToken || '',
+        uniqueId: a.uniqueId || '',
+        quotas: Array.isArray(a.quotas) ? a.quotas : [],
+        createdAt: a.createdAt || Date.now()
+      }))
+    }
+    const text = JSON.stringify(payload, null, 2)
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `accounts-${new Date().toISOString().slice(0,10)}.txt`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    addLog('账号列表已导出为TXT')
+  } catch (e) {
+    addLog(`导出全部账号失败：${e.message || e}`)
+  }
+}
+
+function onPickImportFile() {
+  try {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.txt,.json,application/json,text/plain'
+    input.onchange = async (e) => {
+      const file = e.target.files && e.target.files[0]
+      if (!file) return
+      importMode.value = 'file'
+      importFileName.value = file.name
+      const text = await file.text()
+      importText.value = text
+      importVisible.value = true
+    }
+    input.click()
+  } catch (e) {
+    addLog(`选择文件失败：${e.message || e}`)
+  }
+}
+
+async function onConfirmImportFileOverwrite() {
+  try {
+    const obj = JSON.parse(importText.value || '{}')
+    if (Array.isArray(obj.accounts)) {
+      let countUpsert = 0
+      for (const item of obj.accounts) {
+        const acc = upsertAccount({
+          name: item.name || '用户',
+          token: item.token || '',
+          phone: item.phone || '',
+          accId: item.accId || '',
+          ticketSNO: item.ticketSNO || '',
+          grabToken: item.grabToken || '',
+          uniqueId: item.uniqueId || '',
+          quotas: Array.isArray(item.quotas) ? item.quotas : [],
+          id: item.id || undefined,
+          createdAt: item.createdAt || undefined
+        })
+        countUpsert += 1
+      }
+      persistAccounts()
+      // 保持当前活动账号不变，如不存在则选择第一个
+      if (!activeAccountId.value && accounts.value.length > 0) {
+        activeAccountId.value = accounts.value[0].id
+      }
+      const activeAcc = accounts.value.find(a => a.id === activeAccountId.value)
+      if (activeAcc) applyActiveAccount(activeAcc)
+      importVisible.value = false
+      addLog(`批量导入完成：共${countUpsert}个账号（已覆盖同ID/同手机号/同token）`)
+    } else {
+      // 兼容单账号导入
+      await onConfirmImport()
+    }
+  } catch (e) {
+    addLog(`导入失败：${e.message || e}`)
+  }
+}
+
 function openImportUser() {
+  importMode.value = 'paste'
   importText.value = ''
   importVisible.value = true
 }
@@ -339,9 +452,10 @@ async function onConfirmImport() {
     const ticketSNO = obj.ticketSNO || ''
     const grabToken = obj.grabToken || ''
     const uniq = obj.uniqueId || ''
+    const quotas = Array.isArray(obj.quotas) ? obj.quotas : []
 
     if (token) {
-      const acc = upsertAccount({ name, token, phone: phoneRaw, accId, ticketSNO, grabToken, uniqueId: String(uniq || '') })
+      const acc = upsertAccount({ name, token, phone: phoneRaw, accId, ticketSNO, grabToken, uniqueId: String(uniq || ''), quotas })
       activeAccountId.value = acc.id
       persistAccounts()
       applyActiveAccount(acc)
@@ -594,15 +708,15 @@ async function getTicketWithRetry() {
     if (aborted.value) throw new Error('已停止')
     attempts++
     try {
-      const res = await grab.get('/hyd-queue/core/simple/entry')
-      const ticket = res?.data?.ticket
-      if (ticket) {
+      const res = await ticketClient.get('/entry')
+      const entryTicket = res?.data?.ticket
+      if (entryTicket) {
         addLog(`🎫 获取到票据，正在校验...`)
         // validate ticket
-        const check = await grab.post('/ai-smart-subsidy-approval/api/queue/ticket/check', { ticket })
+        const check = await grab.post('/ai-smart-subsidy-approval/api/queue/ticket/check', { ticket: entryTicket })
         if (check?.success) {
           addLog(`✅ 票据校验通过！${check?.message ? '：'+check.message : ''}`)
-          return ticket
+          return entryTicket
         } else {
           addLog(`❌ 票据校验未通过${check?.message ? '：'+check.message : ''}，重新获取`)
         }
@@ -669,6 +783,62 @@ async function submitApplyWithRetry({ uniqueIdVal, positionId, ticket, foodSubsi
   }
 }
 
+async function submitMultiQuotasWithService({ uniqueIdVal, quotas, ticket }) {
+  try {
+    const payload = {
+      uniqueId: String(uniqueIdVal),
+      ticket,
+      quotas: quotas.map(q => ({ tourismSubsidyId: q.tourismSubsidyId, ...(q.foodSubsidyId ? { foodSubsidyId: q.foodSubsidyId } : {}) })),
+    }
+    const res = await submitClient.post('/apply', payload)
+    return res
+  } catch (e) {
+    return { success: false, message: e.message || String(e) }
+  }
+}
+
+async function getPositionsForQuotasWithRetry(amounts) {
+  const targets = (amounts || []).map(a => Number(a)).filter(a => !Number.isNaN(a))
+  let attempts = 0
+  addLog(`🔍 开始获取档位信息（多档位），目标补贴：${targets.join(', ')}`)
+  while (true) {
+    if (aborted.value) throw new Error('已停止')
+    attempts++
+    try {
+      const res = await grab.post('/ai-smart-subsidy-approval/api/apply/getApplySubsidyPositionList')
+      const list = res?.data?.tourismSubsidyPositions || []
+      const foodList = res?.data?.foodSubsidyPositions || []
+      let foodId = null
+      if (Array.isArray(foodList) && foodList.length > 0) {
+        const maxFood = foodList.reduce((a, b) => Number(a.subsidyAmount) >= Number(b.subsidyAmount) ? a : b)
+        foodId = maxFood?.id ?? null
+      }
+      const mapping = {}
+      let allFound = true
+      for (const amt of targets) {
+        const match = list.find(x => Number(x.subsidyAmount) === Number(amt))
+        if (match?.id) {
+          mapping[amt] = match.id
+        } else {
+          allFound = false
+        }
+      }
+      if (allFound) {
+        addLog(`✅ 多档位匹配成功！ids=${targets.map(a => mapping[a]).join(', ')}${res?.message ? '：'+res.message : ''}`)
+        return { tourismIdByAmount: mapping, foodId }
+      }
+      if (attempts % 20 === 1) {
+        addLog(`⏳ 档位未就绪（多档位），继续等待... (第${attempts}次尝试) ${res?.message ? '（'+res.message+'）' : ''}`)
+      }
+    } catch (e) {
+      if (attempts % 20 === 1) {
+        addLog(`❌ 获取档位失败（多档位），继续重试... (第${attempts}次尝试) ${e.message || e}`)
+      }
+    }
+    await sleep(200)
+  }
+}
+
 async function startGrab() {
   if (!isLoggedIn.value) {
     addLog('请先登录')
@@ -686,32 +856,51 @@ async function startGrab() {
     addLog('📋 确保uniqueId已获取...')
     await ensureUniqueId()
     
-    addLog('🎯 获取档位信息...')
-    const { tourismId, foodId } = await getPositionsWithRetry()
-    
-    addLog('🎫 获取入场票据...')
-    const ticket = await getTicketWithRetry()
-    
-    addLog('📤 开始提交申请...')
-    const result = await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
-    
-    if (result?.success) {
-      // 播放成功音效
-      playSuccessAudioOnce()
-      
-      // 发送推送通知
-      if (SCT_SEND_URL.value) {
-        await sendPushOnSuccess({
-          name: user.value?.name || '用户',
-          phone: user.value?.phone || '',
-          quota: selectedQuota.value,
-          time: new Date().toLocaleString(),
-          uniqueId: uniqueId.value,
-          isDuplicate: result.isDuplicate || false
-        })
+    if (selectedQuotas.value && selectedQuotas.value.length > 1) {
+      addLog('🎯 获取档位信息（多档位）...')
+      const { tourismIdByAmount, foodId } = await getPositionsForQuotasWithRetry(selectedQuotas.value)
+      addLog('🎫 获取入场票据...')
+      const tk = await getTicketWithRetry()
+      addLog('📤 开始提交申请（多档位并发）...')
+      const quotasPayload = selectedQuotas.value.map(amt => ({ tourismSubsidyId: tourismIdByAmount[Number(amt)], ...(foodId ? { foodSubsidyId: foodId } : {}) }))
+      const resp = await submitMultiQuotasWithService({ uniqueIdVal: uniqueId.value, quotas: quotasPayload, ticket: tk })
+      if (resp?.success) {
+        playSuccessAudioOnce()
+        if (SCT_SEND_URL.value) {
+          await sendPushOnSuccess({
+            name: user.value?.name || '用户',
+            phone: user.value?.phone || '',
+            quota: selectedQuotas.value.join(','),
+            time: new Date().toLocaleString(),
+            uniqueId: uniqueId.value,
+            isDuplicate: !!resp?.isDuplicate
+          })
+        }
+        addLog(`✅ 抢购流程完成！状态：${resp?.isDuplicate ? '重复提交' : '首次成功'}`)
+      } else {
+        addLog(`❌ 并发提交失败：${resp?.message || '未知错误'}`)
       }
-      
-      addLog(`✅ 抢购流程完成！状态：${result.isDuplicate ? '重复提交' : '首次成功'}`)
+    } else {
+      addLog('🎯 获取档位信息...')
+      const { tourismId, foodId } = await getPositionsWithRetry()
+      addLog('🎫 获取入场票据...')
+      const ticket = await getTicketWithRetry()
+      addLog('📤 开始提交申请...')
+      const result = await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
+      if (result?.success) {
+        playSuccessAudioOnce()
+        if (SCT_SEND_URL.value) {
+          await sendPushOnSuccess({
+            name: user.value?.name || '用户',
+            phone: user.value?.phone || '',
+            quota: selectedQuota.value,
+            time: new Date().toLocaleString(),
+            uniqueId: uniqueId.value,
+            isDuplicate: result.isDuplicate || false
+          })
+        }
+        addLog(`✅ 抢购流程完成！状态：${result.isDuplicate ? '重复提交' : '首次成功'}`)
+      }
     }
   } catch (e) {
     addLog(`💥 抢购流程异常：${e.message || e}`)
@@ -754,20 +943,56 @@ const startTargetText = ref('')
 const deviceTimeText = ref('')
 let deviceClockId = null
 
+const quotaEditingId = ref('')
+const quotaEditingValues = ref([])
+
+function startEditQuotasForAccount(acc) {
+  quotaEditingId.value = acc.id
+  quotaEditingValues.value = Array.isArray(acc.quotas) ? [...acc.quotas] : []
+}
+function cancelEditQuotas() {
+  quotaEditingId.value = ''
+  quotaEditingValues.value = []
+}
+function saveEditQuotas(accId) {
+  const idx = accounts.value.findIndex(a => a.id === accId)
+  if (idx < 0) return
+  const set = new Set((quotaEditingValues.value || []).map(v => Number(v)).filter(v => !Number.isNaN(v)))
+  accounts.value[idx] = { ...accounts.value[idx], quotas: Array.from(set) }
+  persistAccounts()
+  if (activeAccountId.value === accId) {
+    selectedQuotas.value = Array.from(set)
+    selectedQuota.value = selectedQuotas.value[0] || null
+  }
+  addLog(`已更新账号档位：${accounts.value[idx].name || ''} ${maskPhone(accounts.value[idx].phone)} → ${accounts.value[idx].quotas && accounts.value[idx].quotas.length ? accounts.value[idx].quotas.join(', ') : '未设置'}`)
+  cancelEditQuotas()
+}
+
 function onStartClick() {
   if (!isLoggedIn.value) {
     addLog('请先登录再开始抢购')
     return
   }
   unlockSuccessAudio()
-  quotaTemp.value = selectedQuota.value || 800
-  quotaVisible.value = true
+  if (selectedQuotas.value && selectedQuotas.value.length > 0) {
+    quotaTempMulti.value = [...selectedQuotas.value]
+    confirmQuotaThenStart()
+  } else {
+    quotaTemp.value = selectedQuota.value || 800
+    quotaTempMulti.value = []
+    quotaVisible.value = true
+  }
 }
 
 function confirmQuotaThenStart() {
-  selectedQuota.value = quotaTemp.value
+  // Backward compatibility: if no multi selected, use single
+  const list = Array.isArray(quotaTempMulti.value) && quotaTempMulti.value.length > 0
+    ? [...new Set(quotaTempMulti.value.map(v => Number(v)))]
+    : [Number(quotaTemp.value || 800)]
+  selectedQuotas.value = list
+  selectedQuota.value = list[0] || null
   quotaVisible.value = false
-  addLog(`选择档位：${selectedQuota.value}，进入预备状态`)
+  addLog(`选择档位：${list.join(', ')}，进入预备状态（并发/档位=${perQuotaConcurrency.value}）`)
   const target = computeTargetDate(startTime.value)
   const diff = target.getTime() - Date.now()
   if (diff <= 0) {
@@ -832,7 +1057,7 @@ onMounted(async () => {
       try {
         const parsed = JSON.parse(saved)
         if (parsed?.token) {
-          const acc = upsertAccount({ name: parsed.name || '用户', token: parsed.token, phone: parsed.phone || '', accId: localStorage.getItem('accId') || '', grabToken: localStorage.getItem('grabToken') || '', ticketSNO: localStorage.getItem('ticketSNO') || '', uniqueId: localStorage.getItem('uniqueId') || '' })
+          const acc = upsertAccount({ name: parsed.name || '用户', token: parsed.token, phone: parsed.phone || '', accId: localStorage.getItem('accId') || '', grabToken: localStorage.getItem('grabToken') || '', ticketSNO: localStorage.getItem('ticketSNO') || '', uniqueId: localStorage.getItem('uniqueId') || '', quotas: parsed.quotas || [] })
           activeAccountId.value = acc.id
         }
       } catch {}
@@ -908,8 +1133,12 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="isLoggedIn" class="row">
         <button class="btn small" @click="onExportUser">导出</button>
+        <button class="btn small" @click="onExportAllAccounts">导出全部</button>
       </div>
-      <button class="btn small" @click="openImportUser">导入</button>
+      <div class="row">
+        <button class="btn small" @click="openImportUser">导入</button>
+        <button class="btn small" @click="onPickImportFile">文件导入</button>
+      </div>
     </section>
 
     <section class="panel">
@@ -928,7 +1157,7 @@ onBeforeUnmount(() => {
           <button class="btn primary" @click="onStartClick" :disabled="isPurchasing || isCounting">开始抢购</button>
           <button class="btn" @click="onStopAll" :disabled="!(isCounting || isPurchasing)">停止</button>
         </div>
-        <div class="hint" v-if="selectedQuota">已选择档位：{{ selectedQuota }}</div>
+        <div class="hint" v-if="selectedQuotas && selectedQuotas.length">已选择档位：{{ selectedQuotas.join(', ') }}（并发/档位：{{ perQuotaConcurrency }}）</div>
         <div class="hint">网络模式：{{ useProxyForWindow ? '代理IP' : '直连IP（本机IP）' }}</div>
       </div>
       <div class="countdown" v-if="isCounting">
@@ -975,10 +1204,14 @@ onBeforeUnmount(() => {
         <div class="modal-title">选择档位</div>
         <div class="modal-body">
           <div class="quota-options">
-            <label class="radio"><input type="radio" value="800" v-model.number="quotaTemp" /> 800</label>
-            <label class="radio"><input type="radio" value="300" v-model.number="quotaTemp" /> 300</label>
-            <label class="radio"><input type="radio" value="1500" v-model.number="quotaTemp" /> 1500</label>
-            <label class="radio"><input type="radio" value="3000" v-model.number="quotaTemp" /> 3000</label>
+            <label class="radio"><input type="checkbox" value="1500" v-model.number="quotaTempMulti" /> 1500</label>
+            <label class="radio"><input type="checkbox" value="800" v-model.number="quotaTempMulti" /> 800</label>
+            <label class="radio"><input type="checkbox" value="300" v-model.number="quotaTempMulti" /> 300</label>
+            <label class="radio"><input type="checkbox" value="3000" v-model.number="quotaTempMulti" /> 3000</label>
+          </div>
+          <div class="row">
+            <label class="label">并发/档位</label>
+            <input class="input" type="number" min="1" max="20" v-model.number="perQuotaConcurrency" />
           </div>
         </div>
         <div class="modal-actions">
@@ -991,13 +1224,13 @@ onBeforeUnmount(() => {
     <!-- Import Modal -->
     <div v-if="importVisible" class="modal-mask" @click.self="importVisible=false">
       <div class="modal">
-        <div class="modal-title">导入用户信息</div>
+        <div class="modal-title">导入用户信息（{{ importMode==='file' ? ('文件：'+importFileName) : '粘贴JSON' }}）</div>
         <div class="modal-body">
           <textarea class="input" rows="8" placeholder="粘贴导出的JSON" v-model.trim="importText"></textarea>
         </div>
         <div class="modal-actions">
           <button class="btn" @click="importVisible=false">取消</button>
-          <button class="btn primary" @click="onConfirmImport">确认导入</button>
+          <button class="btn primary" @click="importMode==='file' ? onConfirmImportFileOverwrite() : onConfirmImport()">确认导入</button>
         </div>
       </div>
     </div>
@@ -1013,10 +1246,20 @@ onBeforeUnmount(() => {
               <div class="acc-info">
                 <div class="acc-name">{{ acc.name }}</div>
                 <div class="acc-phone">{{ (acc.phone || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2') }}</div>
+                <div class="hint">档位：{{ Array.isArray(acc.quotas) && acc.quotas.length ? acc.quotas.join(', ') : '未设置' }}</div>
+                <div v-if="quotaEditingId===acc.id" class="quota-options" style="margin-top:6px;">
+                  <label class="radio"><input type="checkbox" value="1500" v-model.number="quotaEditingValues" /> 1500</label>
+                  <label class="radio"><input type="checkbox" value="800" v-model.number="quotaEditingValues" /> 800</label>
+                  <label class="radio"><input type="checkbox" value="300" v-model.number="quotaEditingValues" /> 300</label>
+                  <label class="radio"><input type="checkbox" value="3000" v-model.number="quotaEditingValues" /> 3000</label>
+                </div>
               </div>
               <div class="acc-actions">
-                <button class="btn small" :disabled="activeAccountId===acc.id" @click="switchAccount(acc.id)">{{ activeAccountId===acc.id ? '当前' : '切换' }}</button>
-                <button class="btn small" @click="deleteAccount(acc.id)" :disabled="accounts.length<=1 && activeAccountId===acc.id">删除</button>
+                <button class="btn small" :disabled="activeAccountId===acc.id || quotaEditingId===acc.id" @click="switchAccount(acc.id)">{{ activeAccountId===acc.id ? '当前' : '切换' }}</button>
+                <button class="btn small" @click="deleteAccount(acc.id)" :disabled="accounts.length<=1 && activeAccountId===acc.id || quotaEditingId===acc.id">删除</button>
+                <button class="btn small" v-if="quotaEditingId!==acc.id" @click="startEditQuotasForAccount(acc)" :disabled="activeAccountId!==acc.id">编辑</button>
+                <button class="btn small" v-else @click="saveEditQuotas(acc.id)">保存</button>
+                <button class="btn small" v-if="quotaEditingId===acc.id" @click="cancelEditQuotas">取消</button>
               </div>
             </div>
           </div>
@@ -1214,7 +1457,7 @@ h2 {
 }
 
 .modal {
-  width: 360px;
+  width: 460px;
   background: var(--c-surface-1);
   border: 1px solid var(--c-border);
   border-radius: 10px;
