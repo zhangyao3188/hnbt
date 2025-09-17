@@ -856,51 +856,43 @@ async function startGrab() {
     addLog('📋 确保uniqueId已获取...')
     await ensureUniqueId()
     
-    if (selectedQuotas.value && selectedQuotas.value.length > 1) {
-      addLog('🎯 获取档位信息（多档位）...')
-      const { tourismIdByAmount, foodId } = await getPositionsForQuotasWithRetry(selectedQuotas.value)
-      addLog('🎫 获取入场票据...')
-      const tk = await getTicketWithRetry()
-      addLog('📤 开始提交申请（多档位并发）...')
-      const quotasPayload = selectedQuotas.value.map(amt => ({ tourismSubsidyId: tourismIdByAmount[Number(amt)], ...(foodId ? { foodSubsidyId: foodId } : {}) }))
-      const resp = await submitMultiQuotasWithService({ uniqueIdVal: uniqueId.value, quotas: quotasPayload, ticket: tk })
-      if (resp?.success) {
-        playSuccessAudioOnce()
-        if (SCT_SEND_URL.value) {
-          await sendPushOnSuccess({
-            name: user.value?.name || '用户',
-            phone: user.value?.phone || '',
-            quota: selectedQuotas.value.join(','),
-            time: new Date().toLocaleString(),
-            uniqueId: uniqueId.value,
-            isDuplicate: !!resp?.isDuplicate
-          })
-        }
-        addLog(`✅ 抢购流程完成！状态：${resp?.isDuplicate ? '重复提交' : '首次成功'}`)
-      } else {
-        addLog(`❌ 并发提交失败：${resp?.message || '未知错误'}`)
+    // 统一使用批量提交服务（submit.server.js），无论单档位还是多档位
+    const quotasToSubmit = selectedQuotas.value && selectedQuotas.value.length > 0 
+      ? selectedQuotas.value 
+      : [selectedQuota.value]
+    
+    addLog(`🎯 获取档位信息（批量提交），目标档位：${quotasToSubmit.join(', ')}`)
+    const { tourismIdByAmount, foodId } = await getPositionsForQuotasWithRetry(quotasToSubmit)
+    addLog('🎫 获取入场票据...')
+    const tk = await getTicketWithRetry()
+    addLog('📤 开始提交申请（批量并发）...')
+    
+    const quotasPayload = quotasToSubmit.map(amt => ({ 
+      tourismSubsidyId: tourismIdByAmount[Number(amt)], 
+      ...(foodId ? { foodSubsidyId: foodId } : {}) 
+    }))
+    
+    const resp = await submitMultiQuotasWithService({ 
+      uniqueIdVal: uniqueId.value, 
+      quotas: quotasPayload, 
+      ticket: tk 
+    })
+    
+    if (resp?.success) {
+      playSuccessAudioOnce()
+      if (SCT_SEND_URL.value) {
+        await sendPushOnSuccess({
+          name: user.value?.name || '用户',
+          phone: user.value?.phone || '',
+          quota: quotasToSubmit.join(','),
+          time: new Date().toLocaleString(),
+          uniqueId: uniqueId.value,
+          isDuplicate: !!resp?.isDuplicate
+        })
       }
+      addLog(`✅ 抢购流程完成！状态：${resp?.isDuplicate ? '重复提交' : '首次成功'}`)
     } else {
-      addLog('🎯 获取档位信息...')
-      const { tourismId, foodId } = await getPositionsWithRetry()
-      addLog('🎫 获取入场票据...')
-      const ticket = await getTicketWithRetry()
-      addLog('📤 开始提交申请...')
-      const result = await submitApplyWithRetry({ uniqueIdVal: uniqueId.value, positionId: tourismId, foodSubsidyId: foodId, ticket })
-      if (result?.success) {
-        playSuccessAudioOnce()
-        if (SCT_SEND_URL.value) {
-          await sendPushOnSuccess({
-            name: user.value?.name || '用户',
-            phone: user.value?.phone || '',
-            quota: selectedQuota.value,
-            time: new Date().toLocaleString(),
-            uniqueId: uniqueId.value,
-            isDuplicate: result.isDuplicate || false
-          })
-        }
-        addLog(`✅ 抢购流程完成！状态：${result.isDuplicate ? '重复提交' : '首次成功'}`)
-      }
+      addLog(`❌ 批量提交失败：${resp?.message || '未知错误'}`)
     }
   } catch (e) {
     addLog(`💥 抢购流程异常：${e.message || e}`)
