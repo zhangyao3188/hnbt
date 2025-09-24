@@ -86,9 +86,14 @@ const isLoggingIn = ref(false)
 const user = ref(null) // { id, phone(masked), name, token, accId? }
 
 // ===== Multi-accounts =====
-const accounts = ref([]) // [{ id, name, phone, token, accId, grabToken, ticketSNO, uniqueId, createdAt }]
+const accounts = ref([]) // [{ id, name, phone, token, accId, grabToken, ticketSNO, uniqueId, createdAt, quotas: [300, 800] }]
 const activeAccountId = ref('')
 const accountsVisible = ref(false)
+
+// 档位选择相关状态
+const quotaSelectionVisible = ref(false)
+const tempAccountForQuota = ref(null)
+const selectedQuotas = ref([]) // 多选档位
 
 function persistAccounts() {
   try {
@@ -113,7 +118,8 @@ function upsertAccount(partial) {
     grabToken: partial.grabToken || '',
     ticketSNO: partial.ticketSNO || '',
     uniqueId: partial.uniqueId || '',
-    createdAt: partial.createdAt || Date.now()
+    createdAt: partial.createdAt || Date.now(),
+    quotas: partial.quotas || [] // 新增 quotas 字段
   }
   if (idx >= 0) {
     accounts.value[idx] = { ...accounts.value[idx], ...base }
@@ -148,6 +154,9 @@ function applyActiveAccount(acc) {
   if (acc.ticketSNO) localStorage.setItem('ticketSNO', acc.ticketSNO)
   if (acc.grabToken) localStorage.setItem('grabToken', acc.grabToken)
   if (acc.uniqueId) localStorage.setItem('uniqueId', acc.uniqueId)
+  
+  // 调试日志
+  addLog(`账号已切换：${acc.name} | token: ${acc.token ? acc.token.slice(-8) : '无'} | grabToken: ${acc.grabToken ? acc.grabToken.slice(-8) : '无'}`)
 }
 
 function switchAccount(id) {
@@ -218,10 +227,18 @@ const captchaVisible = ref(false)
 const importVisible = ref(false)
 const importText = ref('')
 
+// 批量文件操作状态
+const batchImportVisible = ref(false)
+const batchFileInput = ref(null)
+
+// URL参数自动化状态
+const urlParams = ref({ quota: null, index: null })
+const autoMode = ref(false)
+
 // Purchase related state
 const selectedQuota = ref(null) // 800 or 300
 const quotaVisible = ref(false)
-const quotaTemp = ref(800)
+const quotaTemp = ref(300)
 const uniqueId = ref('')
 const isPurchasing = ref(false)
 const aborted = ref(false)
@@ -309,7 +326,8 @@ async function onExportUser() {
       accId: localStorage.getItem('accId') || '',
       ticketSNO: localStorage.getItem('ticketSNO') || '',
       grabToken: localStorage.getItem('grabToken') || '',
-      uniqueId: localStorage.getItem('uniqueId') || ''
+      uniqueId: localStorage.getItem('uniqueId') || '',
+      quotas: [] // 单个导出时，档位为空，需要后续设置
     }
     const text = JSON.stringify(data, null, 2)
     if (navigator.clipboard?.writeText) {
@@ -328,6 +346,187 @@ async function onExportUser() {
   }
 }
 
+// 批量导出所有账号到txt文件
+async function onBatchExport() {
+  try {
+    if (accounts.value.length === 0) {
+      addLog('没有账号可导出')
+      return
+    }
+    
+    const lines = accounts.value.map(acc => {
+      const data = {
+        name: acc.name,
+        phone: acc.phone,
+        token: acc.token,
+        accId: acc.accId,
+        ticketSNO: acc.ticketSNO,
+        grabToken: acc.grabToken,
+        uniqueId: acc.uniqueId,
+        quotas: acc.quotas || []
+      }
+      return JSON.stringify(data)
+    })
+    
+    const content = lines.join('\n')
+    const blob = new Blob([content], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `accounts_${new Date().toISOString().slice(0,10)}.txt`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    
+    addLog(`已导出 ${accounts.value.length} 个账号到txt文件`)
+  } catch (e) {
+    addLog(`批量导出失败：${e.message || e}`)
+  }
+}
+
+// 打开批量导入窗口
+function openBatchImport() {
+  if (batchFileInput.value) {
+    batchFileInput.value.click()
+  }
+}
+
+function closeBatchImport() {
+  batchImportVisible.value = false
+  if (batchFileInput.value) {
+    batchFileInput.value.value = ''
+  }
+}
+
+// 处理文件上传
+function handleFileUpload(event) {
+  const file = event.target.files[0]
+  if (!file) return
+  
+  if (!file.name.endsWith('.txt')) {
+    addLog('请选择txt文件')
+    return
+  }
+  
+  const reader = new FileReader()
+  reader.onload = async (e) => {
+    try {
+      const content = e.target.result
+      const lines = content.split('\n').filter(line => line.trim())
+      let successCount = 0
+      let errorCount = 0
+      
+      for (const line of lines) {
+        try {
+          const obj = JSON.parse(line.trim())
+          if (obj.token) {
+            const acc = upsertAccount({
+              name: obj.name || '用户',
+              token: obj.token,
+              phone: obj.phone || '',
+              accId: obj.accId || '',
+              ticketSNO: obj.ticketSNO || '',
+              grabToken: obj.grabToken || '',
+              uniqueId: String(obj.uniqueId || ''),
+              quotas: obj.quotas || []
+            })
+            successCount++
+          }
+        } catch (lineError) {
+          errorCount++
+          console.error('解析行失败:', line, lineError)
+        }
+      }
+      
+      addLog(`批量导入完成：成功 ${successCount} 个，失败 ${errorCount} 个`)
+      closeBatchImport()
+    } catch (e) {
+      addLog(`文件读取失败：${e.message || e}`)
+    }
+  }
+  reader.readAsText(file)
+}
+
+// URL参数解析和自动化相关函数
+function parseUrlParams() {
+  const params = new URLSearchParams(window.location.search)
+  const quota = params.get('quota')
+  const index = params.get('index')
+  
+  if (quota && index) {
+    urlParams.value = {
+      quota: parseInt(quota),
+      index: parseInt(index)
+    }
+    autoMode.value = true
+    addLog(`检测到URL参数：档位=${quota}，序号=${index}，启用自动模式`)
+    return true
+  }
+  return false
+}
+
+// 根据URL参数筛选并切换账号
+function autoSelectAccountByUrl() {
+  if (!autoMode.value || !urlParams.value.quota || !urlParams.value.index) {
+    return false
+  }
+  
+  // 筛选指定档位的账号
+  const targetAccounts = accounts.value.filter(acc => 
+    acc.quotas && acc.quotas.includes(urlParams.value.quota)
+  )
+  
+  if (targetAccounts.length === 0) {
+    addLog(`未找到档位 ${urlParams.value.quota} 的账号`)
+    return false
+  }
+  
+  // 获取指定序号的账号（从1开始计数）
+  const targetIndex = urlParams.value.index - 1
+  if (targetIndex < 0 || targetIndex >= targetAccounts.length) {
+    addLog(`档位 ${urlParams.value.quota} 只有 ${targetAccounts.length} 个账号，无法选择第 ${urlParams.value.index} 个`)
+    return false
+  }
+  
+  const targetAccount = targetAccounts[targetIndex]
+  
+  // 切换到目标账号
+  activeAccountId.value = targetAccount.id
+  persistAccounts()
+  selectedQuota.value = urlParams.value.quota
+  
+  addLog(`自动选择账号：${targetAccount.name} (${maskPhone(targetAccount.phone)})，档位：${urlParams.value.quota}`)
+  return true
+}
+
+// 自动触发开始流程
+function autoTriggerStart() {
+  if (!autoMode.value) return
+  
+  addLog('自动模式：准备开始抢购流程...')
+  // 模拟点击开始按钮的逻辑，但跳过档位选择
+  if (!isLoggedIn.value) {
+    addLog('自动模式失败：未登录')
+    return
+  }
+  
+  unlockSuccessAudio()
+  
+  // 直接进入倒计时，不显示档位选择弹窗
+  const target = computeTargetDate(startTime.value)
+  const diff = target.getTime() - Date.now()
+  if (diff <= 0) {
+    addLog('设置时间已过，立即开始抢购')
+    startGrab()
+    return
+  }
+  
+  startTargetText.value = formatTime(target)
+  startCountdownInternal(target)
+  addLog('自动模式：已启动倒计时')
+}
+
 function openImportUser() {
   importText.value = ''
   importVisible.value = true
@@ -343,9 +542,21 @@ async function onConfirmImport() {
     const ticketSNO = obj.ticketSNO || ''
     const grabToken = obj.grabToken || ''
     const uniq = obj.uniqueId || ''
+    const quotas = obj.quotas || []
 
     if (token) {
-      const acc = upsertAccount({ name, token, phone: phoneRaw, accId, ticketSNO, grabToken, uniqueId: String(uniq || '') })
+      const acc = upsertAccount({ name, token, phone: phoneRaw, accId, ticketSNO, grabToken, uniqueId: String(uniq || ''), quotas })
+      
+      // 如果账号没有档位信息，弹出档位选择窗口
+      if (!quotas || quotas.length === 0) {
+        tempAccountForQuota.value = acc
+        selectedQuotas.value = []
+        quotaSelectionVisible.value = true
+        importVisible.value = false
+        addLog('导入账号成功，请选择档位')
+        return
+      }
+      
       activeAccountId.value = acc.id
       persistAccounts()
       applyActiveAccount(acc)
@@ -357,6 +568,42 @@ async function onConfirmImport() {
   } catch (e) {
     addLog(`导入失败：${e.message || e}`)
   }
+}
+
+// 档位选择相关函数
+function openQuotaSelection(account) {
+  tempAccountForQuota.value = account
+  selectedQuotas.value = [...(account.quotas || [])]
+  quotaSelectionVisible.value = true
+}
+
+function closeQuotaSelection() {
+  quotaSelectionVisible.value = false
+  tempAccountForQuota.value = null
+  selectedQuotas.value = []
+}
+
+function toggleQuotaSelection(quota) {
+  const index = selectedQuotas.value.indexOf(quota)
+  if (index > -1) {
+    selectedQuotas.value.splice(index, 1)
+  } else {
+    selectedQuotas.value.push(quota)
+  }
+}
+
+function confirmQuotaSelection() {
+  if (!tempAccountForQuota.value) return
+  
+  const account = tempAccountForQuota.value
+  const idx = accounts.value.findIndex(a => a.id === account.id)
+  if (idx >= 0) {
+    accounts.value[idx].quotas = [...selectedQuotas.value]
+    persistAccounts()
+    addLog(`已为账号 ${account.name} 设置档位：${selectedQuotas.value.join(', ')}`)
+  }
+  
+  closeQuotaSelection()
 }
 
 // ===== Captcha & SMS =====
@@ -798,7 +1045,7 @@ async function startGrab() {
 }
 
 // ===== Purchase control =====
-const startTime = ref('09:55:00')
+const startTime = ref('11:58:40')
 const countdownText = ref('')
 const isCounting = ref(false)
 let timerId = null
@@ -830,13 +1077,49 @@ const startTargetText = ref('')
 const deviceTimeText = ref('')
 let deviceClockId = null
 
+// 档位统计
+const quotaStats = computed(() => {
+  const stats = { 300: 0, 800: 0, 1500: 0, 3000: 0, total: 0 }
+  
+  accounts.value.forEach(acc => {
+    if (acc.quotas && Array.isArray(acc.quotas)) {
+      acc.quotas.forEach(quota => {
+        if (stats.hasOwnProperty(quota)) {
+          stats[quota]++
+        }
+      })
+    }
+  })
+  
+  stats.total = accounts.value.length
+  return stats
+})
+
+// 当前账号支持的档位选项
+const availableQuotaOptions = computed(() => {
+  const currentAccount = accounts.value.find(acc => acc.id === activeAccountId.value)
+  if (!currentAccount || !currentAccount.quotas || currentAccount.quotas.length === 0) {
+    // 如果当前账号没有档位信息，显示所有选项
+    return [300, 800, 1500, 3000]
+  }
+  // 返回当前账号支持的档位，并按数值排序
+  return [...currentAccount.quotas].sort((a, b) => a - b)
+})
+
 function onStartClick() {
   if (!isLoggedIn.value) {
     addLog('请先登录再开始抢购')
     return
   }
   unlockSuccessAudio()
-  quotaTemp.value = selectedQuota.value || 800
+  
+  // 设置默认档位：优先使用已选择的档位，否则使用当前账号支持的第一个档位
+  if (availableQuotaOptions.value.includes(selectedQuota.value)) {
+    quotaTemp.value = selectedQuota.value
+  } else {
+    quotaTemp.value = availableQuotaOptions.value[0] || 300
+  }
+  
   quotaVisible.value = true
 }
 
@@ -899,6 +1182,9 @@ onMounted(async () => {
   // initialize proxy state
   initProxyState()
 
+  // 解析URL参数
+  const hasUrlParams = parseUrlParams()
+
   // Load accounts first
   try {
     const savedAccounts = JSON.parse(localStorage.getItem('accounts') || '[]')
@@ -920,11 +1206,41 @@ onMounted(async () => {
     }
   }
 
-  if (activeAccountId.value) {
-    const acc = accounts.value.find(a => a.id === activeAccountId.value) || accounts.value[0]
-    if (acc) {
-      applyActiveAccount(acc)
-      await refreshGrabAuthAndUniqueId()
+  // 如果是自动模式，优先处理URL参数选择账号
+  if (autoMode.value) {
+    const success = autoSelectAccountByUrl()
+    if (success) {
+      // URL模式下，直接使用选中的账号进行初始化
+      const targetAccount = accounts.value.find(a => a.id === activeAccountId.value)
+      if (targetAccount) {
+        addLog(`自动模式：应用账号信息 - ${targetAccount.name}`)
+        applyActiveAccount(targetAccount)
+        
+        addLog(`自动模式：开始刷新grabToken和uniqueId`)
+        await refreshGrabAuthAndUniqueId()
+        
+        // 自动模式下立即开始预加载档位信息
+        addLog(`自动模式：开始预加载档位信息`)
+        preloadPositions()
+        
+        // 延迟一下确保所有状态都已设置
+        setTimeout(() => {
+          autoTriggerStart()
+        }, 500)
+      } else {
+        addLog(`自动模式：未找到目标账号 ID=${activeAccountId.value}`)
+      }
+    } else {
+      addLog('自动模式：账号选择失败')
+    }
+  } else {
+    // 非自动模式，使用原有逻辑
+    if (activeAccountId.value) {
+      const acc = accounts.value.find(a => a.id === activeAccountId.value) || accounts.value[0]
+      if (acc) {
+        applyActiveAccount(acc)
+        await refreshGrabAuthAndUniqueId()
+      }
     }
   }
 
@@ -989,8 +1305,48 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="isLoggedIn" class="row">
         <button class="btn small" @click="onExportUser">导出</button>
+        <button class="btn small" @click="onBatchExport">批量导出</button>
       </div>
-      <button class="btn small" @click="openImportUser">导入</button>
+      <div class="row">
+        <button class="btn small" @click="openImportUser">导入</button>
+        <button class="btn small" @click="openBatchImport">批量导入</button>
+      </div>
+      <input type="file" ref="batchFileInput" @change="handleFileUpload" style="display: none;" accept=".txt" />
+      
+      <!-- 档位统计 -->
+      <div v-if="accounts.length > 0" class="quota-stats">
+        <h3>档位统计</h3>
+        <div class="stats-grid">
+          <div class="stat-item">
+            <span class="stat-label">300档：</span>
+            <span class="stat-value">{{ quotaStats[300] }}个</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">800档：</span>
+            <span class="stat-value">{{ quotaStats[800] }}个</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">1500档：</span>
+            <span class="stat-value">{{ quotaStats[1500] }}个</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">3000档：</span>
+            <span class="stat-value">{{ quotaStats[3000] }}个</span>
+          </div>
+          <div class="stat-item total">
+            <span class="stat-label">总账号：</span>
+            <span class="stat-value">{{ quotaStats.total }}个</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" v-if="autoMode">
+      <h2>自动模式</h2>
+      <div class="hint">
+        URL参数：档位 {{ urlParams.quota }}，序号 {{ urlParams.index }}
+        <br>当前账号：{{ user?.name || '未选择' }} ({{ user?.phone || '' }})
+      </div>
     </section>
 
     <section class="panel">
@@ -1006,7 +1362,7 @@ onBeforeUnmount(() => {
         <label class="label">开始时间</label>
         <input class="input time-input" type="time" step="1" v-model="startTime" />
         <div class="row">
-          <button class="btn primary" @click="onStartClick" :disabled="isPurchasing || isCounting">开始抢购</button>
+          <button class="btn primary" @click="onStartClick" :disabled="isPurchasing || isCounting || autoMode">{{ autoMode ? '自动模式' : '开始抢购' }}</button>
           <button class="btn" @click="onStopAll" :disabled="!(isCounting || isPurchasing)">停止</button>
         </div>
         <div class="hint" v-if="selectedQuota">已选择档位：{{ selectedQuota }}</div>
@@ -1050,16 +1406,21 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- Quota Modal -->
+    <!-- Quota Modal (手动模式开始抢购) -->
     <div v-if="quotaVisible" class="modal-mask" @click.self="quotaVisible=false">
       <div class="modal">
-        <div class="modal-title">选择档位</div>
+        <div class="modal-title">选择档位 - {{ user?.name }}</div>
         <div class="modal-body">
           <div class="quota-options">
-            <label class="radio"><input type="radio" value="800" v-model.number="quotaTemp" /> 800</label>
-            <label class="radio"><input type="radio" value="300" v-model.number="quotaTemp" /> 300</label>
-            <label class="radio"><input type="radio" value="1500" v-model.number="quotaTemp" /> 1500</label>
-            <label class="radio"><input type="radio" value="3000" v-model.number="quotaTemp" /> 3000</label>
+            <label class="radio" v-for="quota in availableQuotaOptions" :key="quota">
+              <input type="radio" :value="quota" v-model.number="quotaTemp" /> {{ quota }}
+            </label>
+          </div>
+          <div class="hint" v-if="availableQuotaOptions.length < 4">
+            仅显示当前账号支持的档位
+          </div>
+          <div class="hint" v-else>
+            当前账号支持所有档位
           </div>
         </div>
         <div class="modal-actions">
@@ -1094,9 +1455,13 @@ onBeforeUnmount(() => {
               <div class="acc-info">
                 <div class="acc-name">{{ acc.name }}</div>
                 <div class="acc-phone">{{ (acc.phone || '').replace(/(\d{3})\d{4}(\d{4})/, '$1****$2') }}</div>
+                <div class="acc-quotas" v-if="acc.quotas && acc.quotas.length > 0">
+                  档位：{{ acc.quotas.join(', ') }}
+                </div>
               </div>
               <div class="acc-actions">
                 <button class="btn small" :disabled="activeAccountId===acc.id" @click="switchAccount(acc.id)">{{ activeAccountId===acc.id ? '当前' : '切换' }}</button>
+                <button class="btn small" @click="openQuotaSelection(acc)">档位</button>
                 <button class="btn small" @click="deleteAccount(acc.id)" :disabled="accounts.length<=1 && activeAccountId===acc.id">删除</button>
               </div>
             </div>
@@ -1104,6 +1469,33 @@ onBeforeUnmount(() => {
         </div>
         <div class="modal-actions">
           <button class="btn" @click="closeAccounts()">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Quota Selection Modal -->
+    <div v-if="quotaSelectionVisible" class="modal-mask" @click.self="closeQuotaSelection()">
+      <div class="modal">
+        <div class="modal-title">选择档位 - {{ tempAccountForQuota?.name }}</div>
+        <div class="modal-body">
+          <div class="quota-selection">
+            <div class="hint">请选择该账号支持的档位（可多选）：</div>
+            <div class="quota-checkboxes">
+              <label class="checkbox" v-for="quota in [300, 800, 1500, 3000]" :key="quota">
+                <input 
+                  type="checkbox" 
+                  :value="quota" 
+                  :checked="selectedQuotas.includes(quota)"
+                  @change="toggleQuotaSelection(quota)"
+                />
+                <span>{{ quota }}</span>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" @click="closeQuotaSelection()">取消</button>
+          <button class="btn primary" @click="confirmQuotaSelection" :disabled="selectedQuotas.length === 0">确定</button>
         </div>
       </div>
     </div>
@@ -1378,6 +1770,36 @@ textarea.input {
   color: var(--c-muted);
 }
 
+.acc-quotas {
+  font-size: 0.85rem;
+  color: var(--c-primary);
+  margin-top: 0.25rem;
+}
+
+.quota-selection {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.quota-checkboxes {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
+.checkbox input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
 .proxy-toggle {
   display: flex;
   align-items: center;
@@ -1389,5 +1811,52 @@ textarea.input {
 .proxy-toggle input[type="checkbox"] {
   width: auto;
   margin: 0;
+}
+
+/* New styles for quota stats */
+.quota-stats {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: var(--c-surface-2);
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+}
+
+.quota-stats h3 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1rem;
+  color: var(--c-text);
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.75rem;
+}
+
+.stat-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--c-muted);
+}
+
+.stat-label {
+  font-weight: 500;
+  color: var(--c-text);
+}
+
+.stat-value {
+  font-weight: 600;
+  color: var(--c-primary);
+}
+
+.stat-item.total {
+  grid-column: 1 / -1; /* Span across all columns */
+  justify-content: flex-end;
+  font-size: 1rem;
+  color: var(--c-text);
 }
 </style>
