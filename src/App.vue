@@ -226,6 +226,10 @@ const uniqueId = ref('')
 const isPurchasing = ref(false)
 const aborted = ref(false)
 
+// 档位预加载缓存
+const cachedPositions = ref(null) // { tourismId, foodId, timestamp }
+const isPreloadingPositions = ref(false)
+
 // Proxy control state
 const useProxyForWindow = ref(true)
 
@@ -549,6 +553,58 @@ async function ensureUniqueId() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
+// 预加载档位信息（在点击开始后立即执行）
+async function preloadPositions() {
+  if (isPreloadingPositions.value) return // 避免重复请求
+  
+  isPreloadingPositions.value = true
+  addLog(`🔄 开始预加载档位信息，目标补贴：${selectedQuota.value}`)
+  
+  try {
+    let attempts = 0
+    while (true) {
+      if (aborted.value) throw new Error('已停止')
+      attempts++
+      try {
+        const res = await grab.post('/ai-smart-subsidy-approval/api/apply/getApplySubsidyPositionList')
+        const list = res?.data?.tourismSubsidyPositions || []
+        const match = list.find(x => Number(x.subsidyAmount) === Number(selectedQuota.value))
+        const foodList = res?.data?.foodSubsidyPositions || []
+        let foodId = null
+        
+        if (Array.isArray(foodList) && foodList.length > 0) {
+          const maxFood = foodList.reduce((a, b) => Number(a.subsidyAmount) >= Number(b.subsidyAmount) ? a : b)
+          foodId = maxFood?.id ?? null
+          addLog(`🍽️ 预加载餐饮档位：id=${foodId}，补贴=${maxFood?.subsidyAmount}${res?.message ? '：'+res.message : ''}`)
+        }
+        
+        if (match) {
+          cachedPositions.value = {
+            tourismId: match.id,
+            foodId,
+            timestamp: Date.now()
+          }
+          addLog(`✅ 档位预加载成功！旅游档位id=${match.id}，补贴=${match.subsidyAmount}${res?.message ? '：'+res.message : ''}`)
+          break
+        }
+        
+        if (attempts % 20 === 1) {
+          addLog(`⏳ 档位预加载中，继续等待... (第${attempts}次尝试) ${res?.message ? '（'+res.message+'）' : ''}`)
+        }
+      } catch (e) {
+        if (attempts % 20 === 1) {
+          addLog(`❌ 档位预加载失败，继续重试... (第${attempts}次尝试) ${e.message || e}`)
+        }
+      }
+      await sleep(200)
+    }
+  } catch (e) {
+    addLog(`💥 档位预加载异常：${e.message || e}`)
+  } finally {
+    isPreloadingPositions.value = false
+  }
+}
+
 async function getPositionsWithRetry() {
   let attempts = 0
   addLog(`🔍 开始获取档位信息，目标补贴：${selectedQuota.value}`)
@@ -686,8 +742,28 @@ async function startGrab() {
     addLog('📋 确保uniqueId已获取...')
     await ensureUniqueId()
     
-    addLog('🎯 获取档位信息...')
-    const { tourismId, foodId } = await getPositionsWithRetry()
+    let tourismId, foodId
+    
+    // 检查是否有可用的缓存档位信息
+    if (cachedPositions.value && cachedPositions.value.tourismId) {
+      const cacheAge = Date.now() - cachedPositions.value.timestamp
+      // 缓存有效期5分钟
+      if (cacheAge < 5 * 60 * 1000) {
+        addLog('🎯 使用预加载的档位信息...')
+        tourismId = cachedPositions.value.tourismId
+        foodId = cachedPositions.value.foodId
+      } else {
+        addLog('🎯 缓存已过期，重新获取档位信息...')
+        const positions = await getPositionsWithRetry()
+        tourismId = positions.tourismId
+        foodId = positions.foodId
+      }
+    } else {
+      addLog('🎯 获取档位信息...')
+      const positions = await getPositionsWithRetry()
+      tourismId = positions.tourismId
+      foodId = positions.foodId
+    }
     
     addLog('🎫 获取入场票据...')
     const ticket = await getTicketWithRetry()
@@ -722,7 +798,7 @@ async function startGrab() {
 }
 
 // ===== Purchase control =====
-const startTime = ref('09:59:58')
+const startTime = ref('09:55:00')
 const countdownText = ref('')
 const isCounting = ref(false)
 let timerId = null
@@ -768,6 +844,10 @@ function confirmQuotaThenStart() {
   selectedQuota.value = quotaTemp.value
   quotaVisible.value = false
   addLog(`选择档位：${selectedQuota.value}，进入预备状态`)
+  
+  // 立即开始预加载档位信息
+  preloadPositions()
+  
   const target = computeTargetDate(startTime.value)
   const diff = target.getTime() - Date.now()
   if (diff <= 0) {
@@ -808,6 +888,7 @@ function onStopAll() {
   aborted.value = true
   stopCountdown()
   isPurchasing.value = false
+  isPreloadingPositions.value = false // 停止预加载
   addLog('已手动停止当前流程')
 }
 
